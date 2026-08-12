@@ -1,0 +1,21 @@
+# 용량 사고 방지 (계획서 0.2절). 첫 커밋 전에 반드시 적용할 것 - 한 번 커밋되면
+# git 히스토리에서 지우기 번거롭다.
+
+# 사전학습 weight (dit-base-224-p16-500k-62d53a.pth 등, 수백 MB)
+weights/*.pth
+weights/*.pt
+
+# PubLayNet 이미지/annotation (수십 GB)
+data/publaynet/
+
+# 학습/평가 산출물
+**/output/
+**/logs/
+**/inference/
+*.pth
+*.pkl
+*.json.gz
+
+# Python
+__pycache__/
+*.pyc
