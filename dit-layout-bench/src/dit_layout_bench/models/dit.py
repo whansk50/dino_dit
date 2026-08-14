@@ -18,11 +18,14 @@ from torch.utils.checkpoint import checkpoint
 
 
 def _drop_path(x: Tensor, probability: float, training: bool) -> Tensor:
+    if not 0.0 <= probability < 1.0:
+        raise ValueError(f"drop path probability must be in [0, 1), got {probability}")
     if probability == 0.0 or not training:
         return x
     keep = 1.0 - probability
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    return x.div(keep) * torch.empty(shape, dtype=x.dtype, device=x.device).bernoulli_(keep)
+    random_tensor = torch.empty(shape, dtype=x.dtype, device=x.device).bernoulli_(keep)
+    return x.div(keep) * random_tensor
 
 
 class DropPath(nn.Module):
@@ -92,6 +95,8 @@ class Block(nn.Module):
 class PatchEmbed(nn.Module):
     def __init__(self, image_size: tuple[int, int], patch_size: int, dim: int) -> None:
         super().__init__()
+        if any(size % patch_size for size in image_size):
+            raise ValueError("pretraining image dimensions must be divisible by patch size")
         self.img_size = image_size
         self.patch_size = (patch_size, patch_size)
         self.patch_shape = (image_size[0] // patch_size, image_size[1] // patch_size)
@@ -116,8 +121,15 @@ class DiTBase(nn.Module):
         use_checkpoint: bool = True,
     ) -> None:
         super().__init__()
+        if not 0.0 <= drop_path_rate < 1.0:
+            raise ValueError("drop_path_rate must be in [0, 1)")
+        if not out_indices or len(set(out_indices)) != len(out_indices):
+            raise ValueError("out_indices must be non-empty and unique")
+        if min(out_indices) < 0 or max(out_indices) >= 12:
+            raise ValueError("out_indices must refer to transformer layers 0..11")
         self.embed_dim = 768
         self.out_indices = tuple(out_indices)
+        self._out_index_set = set(out_indices)
         self.patch_embed = PatchEmbed(image_size, 16, self.embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_embed = nn.Parameter(
@@ -149,7 +161,10 @@ class DiTBase(nn.Module):
     def _position_tokens(self, height: int, width: int) -> Tensor:
         cls_position = self.pos_embed[:, :1]
         patch_position = self.pos_embed[:, 1:].reshape(
-            1, self.patch_embed.num_patches_h, self.patch_embed.num_patches_w, self.embed_dim
+            1,
+            self.patch_embed.num_patches_h,
+            self.patch_embed.num_patches_w,
+            self.embed_dim,
         )
         patch_position = patch_position.permute(0, 3, 1, 2)
         patch_position = F.interpolate(
@@ -160,22 +175,24 @@ class DiTBase(nn.Module):
     def forward_features(self, images: Tensor) -> OrderedDict[str, Tensor]:
         tokens, (height, width) = self.patch_embed(images)
         cls = self.cls_token.expand(images.shape[0], -1, -1)
-        tokens = self.pos_drop(torch.cat((cls, tokens), dim=1) + self._position_tokens(height, width))
+        positions = self._position_tokens(height, width)
+        tokens = self.pos_drop(torch.cat((cls, tokens), dim=1) + positions)
         outputs: OrderedDict[str, Tensor] = OrderedDict()
         for index, block in enumerate(self.blocks):
             if self.use_checkpoint and self.training and tokens.requires_grad:
                 tokens = checkpoint(block, tokens, use_reentrant=False)
             else:
                 tokens = block(tokens)
-            if index in self.out_indices:
+            if index in self._out_index_set:
                 feature = tokens[:, 1:].transpose(1, 2).reshape(
                     images.shape[0], self.embed_dim, height, width
                 )
                 outputs[f"layer{index}"] = feature.contiguous()
         if len(outputs) != len(self.out_indices):
-            raise RuntimeError(f"Expected {len(self.out_indices)} DiT features, got {len(outputs)}")
+            raise RuntimeError(
+                f"Expected {len(self.out_indices)} DiT features, got {len(outputs)}"
+            )
         return outputs
 
     def forward(self, images: Tensor) -> OrderedDict[str, Tensor]:
         return self.forward_features(images)
-

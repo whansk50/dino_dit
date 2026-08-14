@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+from typing import Any
 
-def parameter_groups(model, *, detector_lr: float, backbone_lr: float):
+
+LOGGER = logging.getLogger(__name__)
+
+
+def parameter_groups(
+    model: Any, *, detector_lr: float, backbone_lr: float
+) -> list[dict[str, Any]]:
     """Use the low LR only for the pretrained DiT encoder.
 
     The randomly initialized shared pyramid remains in the detector-rate group.
@@ -24,7 +32,7 @@ def parameter_groups(model, *, detector_lr: float, backbone_lr: float):
         raise RuntimeError(
             f"Invalid optimizer split: encoder={len(encoder)}, detector={len(detector)}"
         )
-    print(
+    LOGGER.info(
         "Optimizer parameters: "
         f"DiT encoder={counts['encoder']:,} @ {backbone_lr:g}; "
         f"detector+pyramid={counts['detector_and_pyramid']:,} @ {detector_lr:g}"
@@ -33,4 +41,3 @@ def parameter_groups(model, *, detector_lr: float, backbone_lr: float):
         {"params": detector, "lr": detector_lr},
         {"params": encoder, "lr": backbone_lr},
     ]
-

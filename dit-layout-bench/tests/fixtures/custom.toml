@@ -1,0 +1,5 @@
+[training]
+epochs = 20
+
+[dino]
+num_queries = 450

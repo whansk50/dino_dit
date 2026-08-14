@@ -3,17 +3,42 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
+from importlib import util as importlib_util
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Iterator
 
 from dit_layout_bench.paths import DINO_ROOT, PROJECT_ROOT, require_path
-from dit_layout_bench.spec import MAX_LONG_EDGE, PIXEL_MEAN_01, PIXEL_STD_01, SHORT_EDGE_SCALES
+
+
+DINO_CONFIG = PROJECT_ROOT / "configs" / "dino_publaynet.py"
+DINO_MAIN_MODULE = "_dit_layout_bench_dino_main"
 
 
 def _activate_dino() -> None:
     root = str(require_path(DINO_ROOT, "DINO source tree"))
     if root not in sys.path:
         sys.path.insert(0, root)
+
+
+def _load_dino_main():
+    """Load DINO's generic ``main.py`` under an unambiguous module name."""
+    _activate_dino()
+    if DINO_MAIN_MODULE in sys.modules:
+        return sys.modules[DINO_MAIN_MODULE]
+    main_path = require_path(DINO_ROOT / "main.py", "DINO entrypoint")
+    spec = importlib_util.spec_from_file_location(DINO_MAIN_MODULE, main_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load DINO entrypoint: {main_path}")
+    module = importlib_util.module_from_spec(spec)
+    sys.modules[DINO_MAIN_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(DINO_MAIN_MODULE, None)
+        raise
+    return module
 
 
 def build_dino_backbone(args):
@@ -35,7 +60,7 @@ def build_dino_backbone(args):
             )
             if args.dit_pretrained:
                 report = load_dit_pretrained(encoder, args.dit_pretrained)
-                print(f"DiT checkpoint: {report}")
+                print(f"DiT checkpoint: {report.summary()}")
             self.pyramid = DiTFeaturePyramid(encoder)
             self.num_channels = self.pyramid.num_channels
 
@@ -76,58 +101,93 @@ def _build_publaynet(image_set, args):
     normalize = transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Normalize(list(PIXEL_MEAN_01), list(PIXEL_STD_01)),
+            transforms.Normalize(list(args.data_norm_mean), list(args.data_norm_std)),
         ]
     )
     if split == "train":
-        pipeline = transforms.Compose(
+        augmentations = []
+        if args.data_random_flip == "horizontal":
+            augmentations.append(transforms.RandomHorizontalFlip())
+        augmentations.extend(
             [
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomResize(list(SHORT_EDGE_SCALES), max_size=MAX_LONG_EDGE),
+                transforms.RandomResize(
+                    list(args.data_aug_scales), max_size=args.data_aug_max_size
+                ),
                 normalize,
             ]
         )
+        pipeline = transforms.Compose(augmentations)
     else:
         pipeline = transforms.Compose(
-            [transforms.RandomResize([max(SHORT_EDGE_SCALES)], max_size=MAX_LONG_EDGE), normalize]
+            [
+                transforms.RandomResize(
+                    [max(args.data_aug_scales)], max_size=args.data_aug_max_size
+                ),
+                normalize,
+            ]
         )
     return CocoDetection(image_dir, annotation, transforms=pipeline, return_masks=False)
 
 
-def run(config, *, evaluate: bool = False) -> None:
-    """Run official DINO training/evaluation after installing scoped adapters."""
-    _activate_dino()
-    import main as dino_main
-    import models.dino.dino as dino_model
-    from dit_layout_bench.evaluation import print_per_category_ap
+def _effective_dino_values(config) -> dict[str, Any]:
+    """Translate the common TOML schema to DINO's SLConfig names."""
+    input_settings = config.input
+    training = config.training
+    detector = config.detector_settings
+    return {
+        "batch_size": config.batch_size,
+        "epochs": config.epochs,
+        "lr": training["detector_lr"],
+        "lr_backbone": training["backbone_lr"],
+        "weight_decay": training["weight_decay"],
+        "dit_pretrained": str(config.pretrained) if config.pretrained else None,
+        "dit_drop_path": config.dit["drop_path"],
+        "dit_use_checkpoint": config.dit["use_checkpoint"],
+        "data_aug_scales": list(input_settings["short_edge_scales"]),
+        "data_aug_max_size": input_settings["max_long_edge"],
+        "data_norm_mean": list(input_settings["mean"]),
+        "data_norm_std": list(input_settings["std"]),
+        "data_random_flip": input_settings["random_flip"],
+        "hidden_dim": detector["hidden_dim"],
+        "num_feature_levels": detector["num_feature_levels"],
+        "enc_layers": detector["enc_layers"],
+        "dec_layers": detector["dec_layers"],
+        "nheads": detector["nheads"],
+        "num_queries": detector["num_queries"],
+        "num_select": detector["num_select"],
+        "use_dn": detector["use_dn"],
+        "dn_number": detector["dn_number"],
+        "lr_drop": detector["lr_drop_epoch"],
+        "save_checkpoint_interval": training["checkpoint_every_epochs"],
+    }
 
-    dino_model.build_backbone = build_dino_backbone
-    dino_main.build_dataset = _build_publaynet
-    from dit_layout_bench.optim import parameter_groups
 
-    dino_main.get_param_dict = lambda args, model: parameter_groups(
-        model, detector_lr=args.lr, backbone_lr=args.lr_backbone
-    )
-    original_evaluate = dino_main.evaluate
+def _option(name: str, value: Any) -> str:
+    if value is None:
+        serialized = "None"
+    elif isinstance(value, (list, tuple)):
+        serialized = ",".join(map(str, value))
+    else:
+        serialized = str(value)
+    return f"{name}={serialized}"
 
-    def evaluate_with_classes(*args, **kwargs):
-        result = original_evaluate(*args, **kwargs)
-        evaluator = result[1]
-        if "bbox" in evaluator.coco_eval:
-            print_per_category_ap(evaluator.coco_eval["bbox"])
-        return result
 
-    dino_main.evaluate = evaluate_with_classes
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    parser = dino_main.get_args_parser()
+def _runner_arguments(config, *, evaluate: bool) -> list[str]:
     arguments = [
-        "--config_file", str(PROJECT_ROOT / "configs" / "dino_publaynet.py"),
-        "--dataset_file", "publaynet",
-        "--coco_path", str(config.data_root),
-        "--output_dir", str(config.output_dir),
-        "--device", config.device,
-        "--seed", str(config.seed),
-        "--num_workers", str(config.num_workers),
+        "--config_file",
+        str(DINO_CONFIG),
+        "--dataset_file",
+        "publaynet",
+        "--coco_path",
+        str(config.data_root),
+        "--output_dir",
+        str(config.output_dir),
+        "--device",
+        config.device,
+        "--seed",
+        str(config.seed),
+        "--num_workers",
+        str(config.num_workers),
     ]
     if config.amp:
         arguments.append("--amp")
@@ -135,16 +195,63 @@ def run(config, *, evaluate: bool = False) -> None:
         arguments.extend(("--resume", str(config.resume)))
     if evaluate:
         arguments.append("--eval")
+    arguments.append("--options")
     arguments.extend(
-        [
-            "--options",
-            f"batch_size={config.batch_size}",
-            f"epochs={config.epochs}",
-            f"dit_pretrained={config.pretrained}" if config.pretrained else "dit_pretrained=None",
-        ]
+        _option(name, value)
+        for name, value in _effective_dino_values(config).items()
     )
-    args = parser.parse_args(arguments)
-    dino_main.main(args)
+    return arguments
+
+
+@contextmanager
+def _patched_dino_runtime(dino_main, dino_model) -> Iterator[None]:
+    """Install DINO integration hooks and restore upstream globals afterwards."""
+    from dit_layout_bench.evaluation import print_per_category_ap
+    from dit_layout_bench.optim import parameter_groups
+
+    originals = {
+        "build_backbone": dino_model.build_backbone,
+        "build_dataset": dino_main.build_dataset,
+        "get_param_dict": dino_main.get_param_dict,
+        "evaluate": dino_main.evaluate,
+    }
+
+    def optimizer_groups(args, model):
+        return parameter_groups(
+            model, detector_lr=args.lr, backbone_lr=args.lr_backbone
+        )
+
+    def evaluate_with_classes(*args, **kwargs):
+        result = originals["evaluate"](*args, **kwargs)
+        evaluator = result[1]
+        if "bbox" in evaluator.coco_eval:
+            print_per_category_ap(evaluator.coco_eval["bbox"])
+        return result
+
+    dino_model.build_backbone = build_dino_backbone
+    dino_main.build_dataset = _build_publaynet
+    dino_main.get_param_dict = optimizer_groups
+    dino_main.evaluate = evaluate_with_classes
+    try:
+        yield
+    finally:
+        dino_model.build_backbone = originals["build_backbone"]
+        dino_main.build_dataset = originals["build_dataset"]
+        dino_main.get_param_dict = originals["get_param_dict"]
+        dino_main.evaluate = originals["evaluate"]
+
+
+def run(config, *, evaluate: bool = False) -> None:
+    """Run official DINO training/evaluation after installing scoped adapters."""
+    _activate_dino()
+    dino_main = _load_dino_main()
+    import models.dino.dino as dino_model
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    parser = dino_main.get_args_parser()
+    args = parser.parse_args(_runner_arguments(config, evaluate=evaluate))
+    with _patched_dino_runtime(dino_main, dino_model):
+        dino_main.main(args)
 
 
 def train(config) -> None:
@@ -165,27 +272,34 @@ def predict(config, image_path: Path, *, score_threshold: float = 0.5):
     from util.misc import nested_tensor_from_tensor_list
     from util.slconfig import SLConfig
     import models.dino.dino as dino_model
-    from main import build_model_main
+    from dit_layout_bench.prediction import prediction_record
 
-    raw = SLConfig.fromfile(str(PROJECT_ROOT / "configs" / "dino_publaynet.py"))
+    raw = SLConfig.fromfile(str(DINO_CONFIG))
     values = raw._cfg_dict.to_dict()
-    values.update(
-        device=config.device,
-        dit_pretrained=str(config.pretrained) if config.pretrained else None,
-    )
+    values.update(_effective_dino_values(config), device=config.device)
     args = SimpleNamespace(**values)
+    dino_main = _load_dino_main()
+    original_backbone = dino_model.build_backbone
     dino_model.build_backbone = build_dino_backbone
-    model, _, postprocessors = build_model_main(args)
+    try:
+        model, _, postprocessors = dino_main.build_model_main(args)
+    finally:
+        dino_model.build_backbone = original_backbone
     checkpoint = torch.load(config.resume, map_location="cpu")
     model.load_state_dict(checkpoint.get("model", checkpoint), strict=True)
     model.to(config.device).eval()
 
     image = Image.open(image_path).convert("RGB")
     original_width, original_height = image.size
-    scale = min(max(SHORT_EDGE_SCALES) / min(image.size), MAX_LONG_EDGE / max(image.size))
+    scale = min(
+        max(config.input["short_edge_scales"]) / min(image.size),
+        config.input["max_long_edge"] / max(image.size),
+    )
     resized = vision.resize(image, [round(original_height * scale), round(original_width * scale)])
     tensor = vision.to_tensor(resized)
-    tensor = vision.normalize(tensor, list(PIXEL_MEAN_01), list(PIXEL_STD_01))
+    tensor = vision.normalize(
+        tensor, list(config.input["mean"]), list(config.input["std"])
+    )
     samples = nested_tensor_from_tensor_list([tensor]).to(config.device)
     with torch.no_grad():
         outputs = model(samples)
@@ -198,12 +312,5 @@ def predict(config, image_path: Path, *, score_threshold: float = 0.5):
     ):
         category_id = int(label)
         if 1 <= category_id <= 5:
-            records.append(
-                {
-                    "image_id": image_path.stem,
-                    "box_xyxy": box.tolist(),
-                    "score": float(score),
-                    "category_id": category_id,
-                }
-            )
+            records.append(prediction_record(image_path.stem, box, score, category_id))
     return records

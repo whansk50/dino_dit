@@ -1,6 +1,5 @@
-from dit_layout_bench.cli import evaluate_entrypoint
+from _entrypoint import run
 
 
 if __name__ == "__main__":
-    evaluate_entrypoint()
-
+    run("evaluate_entrypoint")

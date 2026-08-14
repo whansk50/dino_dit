@@ -43,15 +43,24 @@ class DiTFeaturePyramid(nn.Module):
 
     @staticmethod
     def pad(images: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        if images.ndim != 4:
+            raise ValueError(f"images must have shape [B,C,H,W], got {tuple(images.shape)}")
         height, width = images.shape[-2:]
         padded_height = math.ceil(height / 32) * 32
         padded_width = math.ceil(width / 32) * 32
         pad_height, pad_width = padded_height - height, padded_width - width
-        images = F.pad(images, (0, pad_width, 0, pad_height))
         if mask is None:
             mask = torch.zeros(
                 (images.shape[0], height, width), dtype=torch.bool, device=images.device
             )
+        elif tuple(mask.shape) != (images.shape[0], height, width):
+            raise ValueError(
+                "mask must have shape [B,H,W] matching images; "
+                f"got {tuple(mask.shape)}"
+            )
+        else:
+            mask = mask.to(device=images.device, dtype=torch.bool)
+        images = F.pad(images, (0, pad_width, 0, pad_height))
         mask = F.pad(mask, (0, pad_width, 0, pad_height), value=True)
         return images, mask
 
@@ -69,9 +78,12 @@ class DiTFeaturePyramid(nn.Module):
             expected = (images.shape[-2] // stride, images.shape[-1] // stride)
             if feature.shape[-2:] != expected:
                 raise RuntimeError(
-                    f"{name} has shape {feature.shape[-2:]}, expected {expected} for stride {stride}"
+                    f"{name} has shape {feature.shape[-2:]}, "
+                    f"expected {expected} for stride {stride}"
                 )
             features[name] = feature
-            masks[name] = F.interpolate(mask[:, None].float(), size=expected, mode="nearest")[:, 0].bool()
+            resized_mask = F.interpolate(
+                mask[:, None].float(), size=expected, mode="nearest"
+            )
+            masks[name] = resized_mask[:, 0].bool()
         return features, masks
-

@@ -7,7 +7,10 @@ sample/
 ├── DINO/                         # official IDEA DINO source
 ├── dit/                          # source/checkpoint reference only
 └── dit-layout-bench/
-    ├── configs/dino_publaynet.py
+    ├── configs/
+    │   ├── default.toml          # user-facing defaults
+    │   └── dino_publaynet.py     # internal DINO bridge
+    ├── _entrypoint.py            # direct-script src bootstrap
     ├── src/dit_layout_bench/
     │   ├── backends/
     │   │   ├── cascade_rcnn.py
@@ -19,6 +22,9 @@ sample/
     │   ├── cli.py
     │   ├── config.py
     │   ├── data.py
+    │   ├── evaluation.py
+    │   ├── optim.py
+    │   ├── prediction.py
     │   └── spec.py
     ├── tests/
     ├── train.py
@@ -41,7 +47,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
-python -m pip install -e .
+python -m pip install -e .  # optional; train.py also bootstraps src/ directly
 ```
 
 Install Detectron2 using its official instructions for the selected PyTorch and
@@ -119,6 +125,52 @@ Detectron2 owns batch padding for Cascade R-CNN; the backbone adds any remaining
 stride padding internally.
 
 ## 6. Training
+
+### Configuration precedence
+
+Configuration is applied in this order, with later values winning:
+
+```text
+configs/default.toml
+  → --config partial TOML
+  → --options section.key=value
+  → dedicated CLI flags such as --epochs
+```
+
+`configs/default.toml` is the user-facing configuration. The neighboring
+`dino_publaynet.py` file is an internal adapter that inherits the official DINO
+SLConfig and should normally not be edited.
+
+`--config` may contain only the sections and values that differ from the
+defaults. Unknown keys are rejected instead of being silently ignored. Example:
+
+```toml
+# configs/experiment.toml
+[training]
+batch_size = 4
+epochs = 24
+detector_lr = 5e-5
+backbone_lr = 5e-6
+
+[dino]
+num_queries = 500
+dn_number = 200
+
+[dit]
+drop_path = 0.2
+```
+
+The same values can be changed for one run without creating a file:
+
+```bash
+python train.py --detector dino --data-root /data/publaynet \
+  --pretrained /weights/dit-base.pth \
+  --options training.epochs=24 dino.num_queries=500 dit.drop_path=0.2
+```
+
+Common short aliases such as `epochs=24`, `lr=5e-5`, `lr_backbone=5e-6`, and
+`num_queries=500` are also accepted. Dotted names are preferred because their
+scope is explicit.
 
 Cascade R-CNN:
 

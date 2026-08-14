@@ -1,6 +1,5 @@
-from dit_layout_bench.cli import inference_entrypoint
+from _entrypoint import run
 
 
 if __name__ == "__main__":
-    inference_entrypoint()
-
+    run("inference_entrypoint")

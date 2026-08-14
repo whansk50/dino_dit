@@ -21,6 +21,13 @@ class LoadReport:
     unexpected_keys: tuple[str, ...]
     shape_mismatches: tuple[str, ...]
 
+    def summary(self) -> str:
+        return (
+            f"path={self.path}, sha256={self.sha256}, loaded={self.loaded_keys}, "
+            f"missing={len(self.missing_keys)}, unexpected={len(self.unexpected_keys)}, "
+            f"shape_mismatches={len(self.shape_mismatches)}"
+        )
+
 
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
@@ -36,14 +43,23 @@ def _unwrap(checkpoint: object) -> dict[str, Tensor]:
     state = checkpoint.get("model", checkpoint.get("module", checkpoint))
     if not isinstance(state, Mapping):
         raise TypeError("Checkpoint state_dict must be a mapping")
-    result = {}
+    result: dict[str, Tensor] = {}
+    prefixes = ("module.", "backbone.bottom_up.backbone.", "backbone.")
     for key, value in state.items():
+        if not isinstance(key, str):
+            continue
         if not isinstance(value, Tensor):
             continue
-        for prefix in ("module.", "backbone.bottom_up.backbone.", "backbone."):
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
-                break
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix) :]
+                    changed = True
+                    break
+        if key in result:
+            raise ValueError(f"Checkpoint keys collide after prefix removal: {key}")
         result[key] = value
     return result
 
@@ -51,6 +67,12 @@ def _unwrap(checkpoint: object) -> dict[str, Tensor]:
 def _resize_absolute_position(position: Tensor, target: Tensor) -> Tensor:
     if position.shape == target.shape:
         return position
+    if position.ndim != 3 or target.ndim != 3:
+        raise ValueError("Absolute position embeddings must have shape [1,tokens,channels]")
+    if position.shape[0] != 1 or target.shape[0] != 1:
+        raise ValueError("Absolute position embeddings must have batch dimension 1")
+    if position.shape[-1] != target.shape[-1]:
+        raise ValueError("Absolute position embedding channel dimensions do not match")
     extra = 1
     source_tokens = position.shape[1] - extra
     target_tokens = target.shape[1] - extra
@@ -70,14 +92,22 @@ def _resize_absolute_position(position: Tensor, target: Tensor) -> Tensor:
 
 def load_dit_pretrained(model: nn.Module, path: str | Path) -> LoadReport:
     path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"DiT checkpoint not found: {path}")
     raw = torch.load(path, map_location="cpu")
     state = _unwrap(raw)
     model_state = model.state_dict()
     if "pos_embed" in state and "pos_embed" in model_state:
-        state["pos_embed"] = _resize_absolute_position(state["pos_embed"], model_state["pos_embed"])
+        state["pos_embed"] = _resize_absolute_position(
+            state["pos_embed"], model_state["pos_embed"]
+        )
 
     shape_mismatches = tuple(
-        sorted(key for key in state if key in model_state and state[key].shape != model_state[key].shape)
+        sorted(
+            key
+            for key in state
+            if key in model_state and state[key].shape != model_state[key].shape
+        )
     )
     for key in shape_mismatches:
         del state[key]

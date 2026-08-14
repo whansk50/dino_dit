@@ -1,3 +1,6 @@
+# Internal bridge to IDEA DINO's SLConfig format.
+# User-editable defaults belong in default.toml; the runtime forwards them here
+# through --options so Cascade R-CNN and DINO share one configuration surface.
 _base_ = ['../../DINO/config/DINO/DINO_4scale.py']
 
 # PubLayNet uses category IDs 1..5. DINO expects max category ID + 1.
@@ -13,6 +16,9 @@ num_feature_levels = 4
 
 data_aug_scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 data_aug_max_size = 1333
+data_norm_mean = [0.5, 0.5, 0.5]
+data_norm_std = [0.5, 0.5, 0.5]
+data_random_flip = 'horizontal'
 strong_aug = False
 
 num_queries = 300
@@ -22,4 +28,3 @@ lr_backbone = 1e-5
 batch_size = 2
 epochs = 12
 lr_drop = 11
-

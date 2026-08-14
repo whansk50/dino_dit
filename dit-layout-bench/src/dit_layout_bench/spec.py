@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterable
 
 
@@ -13,14 +12,6 @@ PUBLAYNET_CATEGORIES = {
     4: "Table",
     5: "Figure",
 }
-
-SHORT_EDGE_SCALES = (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
-MAX_LONG_EDGE = 1333
-PIXEL_MEAN_01 = (0.5, 0.5, 0.5)
-PIXEL_STD_01 = (0.5, 0.5, 0.5)
-PIXEL_MEAN_255 = tuple(value * 255 for value in PIXEL_MEAN_01)
-PIXEL_STD_255 = tuple(value * 255 for value in PIXEL_STD_01)
-
 
 def category_id_to_train_label(category_id: int) -> int:
     """Map PubLayNet category IDs (1..5) to contiguous labels (0..4)."""
@@ -40,14 +31,3 @@ def train_label_to_category_id(label: int) -> int:
 def validate_category_ids(category_ids: Iterable[int]) -> None:
     for category_id in category_ids:
         category_id_to_train_label(category_id)
-
-
-@dataclass(frozen=True)
-class Prediction:
-    """Backend-neutral prediction in the original image coordinate system."""
-
-    image_id: int
-    boxes_xyxy: object
-    scores: object
-    category_ids: object
-
