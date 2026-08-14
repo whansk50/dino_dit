@@ -1,0 +1,13 @@
+{
+  "images": [{"id": 7, "file_name": "page.jpg", "width": 10, "height": 10}],
+  "annotations": [
+    {"id": 9, "image_id": 7, "category_id": 1, "bbox": [0, 0, 1, 1], "area": 1, "iscrowd": 0}
+  ],
+  "categories": [
+    {"id": 1, "name": "Text"},
+    {"id": 2, "name": "Title"},
+    {"id": 3, "name": "List"},
+    {"id": 4, "name": "Table"},
+    {"id": 5, "name": "Figure"}
+  ]
+}
