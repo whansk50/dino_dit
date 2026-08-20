@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dit-layout-bench"
+version = "0.2.0"
+description = "PubLayNet benchmark with a shared DiT backbone and switchable Cascade R-CNN/DINO detectors"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.21",
+  "Pillow>=8",
+  "torch>=1.9",
+  "torchvision>=0.10",
+  "pycocotools>=2.0.6",
+  "PyYAML>=6.0",
+  "mlflow>=2.10",
+  "scipy>=1.10",
+  "termcolor>=2",
+  "addict>=2.4",
+  "yapf>=0.40",
+  "timm>=0.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+dit-layout-train = "dit_layout_bench.cli:train_entrypoint"
+dit-layout-evaluate = "dit_layout_bench.cli:evaluate_entrypoint"
+dit-layout-inference = "dit_layout_bench.cli:inference_entrypoint"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.package-data]
+dit_layout_bench = [
+  "resources/*.yaml",
+  "resources/*.py",
+  "_vendor/dino/LICENSE",
+  "_vendor/dino/**/*.py",
+  "_vendor/dino/**/*.json",
+  "_vendor/dino/**/*.cpp",
+  "_vendor/dino/**/*.h",
+  "_vendor/dino/**/*.cu",
+  "_vendor/dino/**/*.cuh",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

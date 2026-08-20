@@ -2,6 +2,7 @@
 """
 Train and eval functions used in main.py
 """
+# Modified for DiTLayoutBench: optional per-training-step metric callback.
 
 import math
 import os

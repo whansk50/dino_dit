@@ -1,0 +1,15 @@
+numpy>=1.21
+Pillow>=8
+torch>=1.9
+torchvision>=0.10
+pycocotools>=2.0.6
+PyYAML>=6.0
+mlflow>=2.10
+scipy>=1.10
+termcolor>=2
+addict>=2.4
+yapf>=0.40
+timm>=0.9
+
+# Install Detectron2 separately using a build compatible with the selected
+# PyTorch and CUDA versions. Build vendor/dino/models/dino/ops before using DINO.

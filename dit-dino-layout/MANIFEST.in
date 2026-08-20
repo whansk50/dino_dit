@@ -1,0 +1,2 @@
+recursive-include src/dit_layout_bench/resources *
+recursive-include src/dit_layout_bench/_vendor/dino *.py *.json *.cpp *.h *.cu *.cuh LICENSE
