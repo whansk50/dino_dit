@@ -155,6 +155,7 @@ def _build_cfg(api: CascadeAPI, config):
     cfg.SOLVER.WARMUP_ITERS = min(
         training["warmup_iters"], max(0, iterations_per_epoch - 1)
     )
+    cfg.SOLVER.WARMUP_FACTOR = training["warmup_factor"]
     cfg.SOLVER.AMP.ENABLED = config.amp
     cfg.TEST.EVAL_PERIOD = iterations_per_epoch * training["evaluate_every_epochs"]
     cfg.OUTPUT_DIR = str(config.output_dir)

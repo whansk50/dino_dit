@@ -45,6 +45,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     _cnt = 0
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header, logger=logger):
 
+        if epoch == 0 and args.warmup_iters > 0 and _cnt <= args.warmup_iters:
+            alpha = _cnt / args.warmup_iters
+            factor = args.warmup_factor * (1 - alpha) + alpha
+            for group in optimizer.param_groups:
+                group['lr'] = group['initial_lr'] * factor
+
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -92,8 +98,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
 
-        if args.onecyclelr:
-            lr_scheduler.step()
         if args.use_ema:
             if epoch >= args.ema_epoch:
                 ema_m.update(model)

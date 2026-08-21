@@ -84,32 +84,22 @@ RGB → horizontal flip(train) → short edge 480..800 / long edge ≤1333
 우선순위는 `default.yaml → --config partial.yaml → --options → 전용 CLI flag`다.
 알 수 없는 key나 기본값과 타입이 다른 값은 거부한다.
 
-```yaml
-training:
-  epochs: 24
-  detector_lr: 5.0e-5
-  backbone_lr: 5.0e-6
-dino:
-  num_queries: 500
-tracking:
-  experiment_name: publaynet-ablation
-```
+`configs/dino_train.yaml`은 DINO 학습에 필요한 실행 경로와 실험 설정을
+버전 관리한다. 새 실험은 이 파일을 복사해 수정한다. 일회성 비교 실험에만
+`--options training.batch_size=4`와 같은 override를 사용한다.
 
 ```bash
-python train.py --config configs/experiment.yaml \
-  --detector dino --data-root /data/publaynet \
-  --pretrained /weights/dit-base.pth \
-  --options training.batch_size=4 run.amp=true
+CUDA_VISIBLE_DEVICES=2 python train.py --config configs/dino_train.yaml
 ```
 
 ## 7. 학습, 평가, 추론
 
 ```bash
-python train.py --detector cascade_rcnn --data-root /data/publaynet \
-  --pretrained /weights/dit-base.pth --output-dir outputs/cascade
+python train.py --config configs/dino_train.yaml
 
-python train.py --detector dino --data-root /data/publaynet \
-  --pretrained /weights/dit-base.pth --output-dir outputs/dino
+# 완료된 마지막 epoch부터 명시적으로 학습 재개
+python train.py --config configs/dino_train.yaml \
+  --resume outputs/dino/checkpoint.pth
 
 python evaluate.py --detector dino --data-root /data/publaynet \
   --resume outputs/dino/checkpoint.pth
@@ -117,6 +107,16 @@ python evaluate.py --detector dino --data-root /data/publaynet \
 python inference.py --detector dino --resume outputs/dino/checkpoint.pth \
   --image page.jpg --json-output prediction.json
 ```
+
+`--resume`을 지정한 경우에만 모델, optimizer, LR scheduler 및 완료 epoch를
+복원한다. resume에는 detector 전체 가중치가 있으므로 `paths.pretrained`는
+생략할 수 있다. 출력 디렉터리에 기존 `checkpoint.pth`가 있더라도
+`--resume`을 생략하면 pretrained 가중치에서 새 학습을 시작한다.
+
+DINO의 linear warmup은 첫 epoch 안에서 `training.warmup_iters`만큼 적용된다.
+평가는 `training.evaluate_every_epochs` 주기와 마지막 epoch에 실행한다.
+`checkpoint.pth`는 안전한 재개를 위해 매 epoch 갱신하고, 번호가 붙은 보관본은
+`training.checkpoint_every_epochs` 주기로 저장한다.
 
 Backbone parameter는 기본 LR `1e-5`, pyramid/detector는 `1e-4`의 별도 AdamW
 group에 들어간다. DINO는 epoch loop, Cascade는 annotation image 수를 기준으로

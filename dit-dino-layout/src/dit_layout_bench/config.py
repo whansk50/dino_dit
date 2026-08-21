@@ -130,15 +130,73 @@ def _validate_settings(settings: Mapping[str, Any]) -> None:
     for key in ("checkpoint_every_epochs", "evaluate_every_epochs"):
         if not isinstance(training[key], int) or training[key] < 1:
             raise ValueError(f"training.{key} must be a positive integer")
-    for key in ("detector_lr", "backbone_lr", "weight_decay"):
+    if training["warmup_iters"] < 0:
+        raise ValueError("training.warmup_iters must be non-negative")
+    for key in ("detector_lr", "backbone_lr", "weight_decay", "warmup_factor"):
         if training[key] < 0:
             raise ValueError(f"training.{key} must be non-negative")
+    if not 0 < training["warmup_factor"] <= 1:
+        raise ValueError("training.warmup_factor must be in (0, 1]")
 
     dino = settings["dino"]
+    if dino["optimizer"] not in {"adam", "adamw"}:
+        raise ValueError("dino.optimizer must be 'adam' or 'adamw'")
+    if dino["scheduler"] not in {"step", "multistep"}:
+        raise ValueError("dino.scheduler must be 'step' or 'multistep'")
+    if len(dino["adam_betas"]) != 2 or any(
+        not 0 <= value < 1 for value in dino["adam_betas"]
+    ):
+        raise ValueError("dino.adam_betas must contain two values in [0, 1)")
+    if not dino["lr_drop_epochs"] or any(
+        epoch < 1 for epoch in dino["lr_drop_epochs"]
+    ):
+        raise ValueError("dino.lr_drop_epochs must contain positive integers")
+    for key in (
+        "hidden_dim",
+        "num_feature_levels",
+        "enc_layers",
+        "dec_layers",
+        "nheads",
+        "dim_feedforward",
+        "enc_n_points",
+        "dec_n_points",
+        "num_queries",
+        "num_select",
+        "lr_drop_epoch",
+    ):
+        if dino[key] < 1:
+            raise ValueError(f"dino.{key} must be positive")
     if dino["hidden_dim"] % dino["nheads"] or dino["hidden_dim"] % 32:
         raise ValueError(
             "dino.hidden_dim must be divisible by nheads and GroupNorm's 32 groups"
         )
+    if dino["dn_number"] < 0:
+        raise ValueError("dino.dn_number must be non-negative")
+    if dino["num_select"] > dino["num_queries"]:
+        raise ValueError("dino.num_select must not exceed dino.num_queries")
+    if not 0 <= dino["dropout"] < 1:
+        raise ValueError("dino.dropout must be in [0, 1)")
+    if dino["clip_max_norm"] < 0:
+        raise ValueError("dino.clip_max_norm must be non-negative")
+    if dino["ema_epoch"] < 0:
+        raise ValueError("dino.ema_epoch must be non-negative")
+    if not 0 < dino["ema_decay"] < 1:
+        raise ValueError("dino.ema_decay must be between 0 and 1")
+    for key in ("dn_box_noise_scale", "dn_label_noise_ratio"):
+        if not 0 <= dino[key] <= 1:
+            raise ValueError(f"dino.{key} must be between 0 and 1")
+    for key in (
+        "set_cost_class",
+        "set_cost_bbox",
+        "set_cost_giou",
+        "cls_loss_coef",
+        "bbox_loss_coef",
+        "giou_loss_coef",
+    ):
+        if dino[key] < 0:
+            raise ValueError(f"dino.{key} must be non-negative")
+    if not 0 <= dino["focal_alpha"] <= 1:
+        raise ValueError("dino.focal_alpha must be between 0 and 1")
 
     cascade = settings["cascade"]
     if len(cascade["anchor_sizes"]) != 4:

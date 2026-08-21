@@ -3,20 +3,13 @@ run:
   device: cuda
   seed: 42
   num_workers: 4
-  amp: false
+  amp: true
 
 paths:
-  data_root: ""
-  output_dir: outputs
-  pretrained: ""
+  data_root: ../publaynet
+  output_dir: outputs/dino
+  pretrained: /workspace/boin-dit/boinDiT/pretrained_model/dit-base-224-p16-500k-62d53a.pth
   resume: ""
-
-input:
-  short_edge_scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
-  max_long_edge: 1333
-  mean: [0.5, 0.5, 0.5]
-  std: [0.5, 0.5, 0.5]
-  random_flip: horizontal
 
 training:
   batch_size: 2
@@ -28,6 +21,13 @@ training:
   warmup_factor: 0.001
   checkpoint_every_epochs: 1
   evaluate_every_epochs: 1
+
+input:
+  short_edge_scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+  max_long_edge: 1333
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+  random_flip: horizontal
 
 dit:
   drop_path: 0.1
@@ -67,16 +67,6 @@ dino:
   ema_decay: 0.9997
   ema_epoch: 0
   score_threshold: 0.5
-
-cascade:
-  score_threshold: 0.5
-  anchor_sizes: [32, 64, 128, 256]
-  aspect_ratios: [0.5, 1.0, 2.0]
-  lr_steps: [0.75, 0.9]
-  class_agnostic_bbox: true
-  roi_batch_size_per_image: 512
-  rpn_batch_size_per_image: 256
-  nms_threshold: 0.5
 
 tracking:
   enabled: true

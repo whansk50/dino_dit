@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 
@@ -25,6 +26,26 @@ class SourceTests(unittest.TestCase):
 
         self.assertEqual(DINO_ROOT, ROOT / "src" / "dit_layout_bench" / "_vendor" / "dino")
         self.assertTrue((DINO_ROOT / "LICENSE").is_file())
+
+    def test_vendored_dino_config_dumps_with_installed_yapf(self):
+        from dit_layout_bench.backends.dino import _activate_dino, DINO_CONFIG
+
+        _activate_dino()
+        from util.slconfig import SLConfig
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "config_cfg.py"
+            SLConfig.fromfile(str(DINO_CONFIG)).dump(output)
+            compile(output.read_text(encoding="utf-8"), str(output), "exec")
+
+    def test_dino_does_not_implicitly_resume_from_output_directory(self):
+        source = (
+            ROOT / "src" / "dit_layout_bench" / "_vendor" / "dino" / "main.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "args.resume = os.path.join(args.output_dir, 'checkpoint.pth')",
+            source,
+        )
 
 
 if __name__ == "__main__":

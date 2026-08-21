@@ -98,9 +98,9 @@ def _validated_config(
 ) -> RunConfig:
     try:
         config = _config(args, require_data=require_data)
-        if require_pretrained and config.pretrained is None:
+        if require_pretrained and config.pretrained is None and config.resume is None:
             raise ValueError(
-                "Training requires --pretrained or paths.pretrained in the config"
+                "New training requires --pretrained or paths.pretrained in the config"
             )
         if require_resume and config.resume is None:
             raise ValueError("This command requires --resume or paths.resume in the config")

@@ -160,8 +160,16 @@ def main(args):
 
     param_dicts = get_param_dict(args, model_without_ddp)
 
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    optimizer_class = {
+        'adam': torch.optim.Adam,
+        'adamw': torch.optim.AdamW,
+    }[args.optimizer]
+    optimizer = optimizer_class(
+        param_dicts,
+        lr=args.lr,
+        betas=tuple(args.adam_betas),
+        weight_decay=args.weight_decay,
+    )
     
 
     dataset_train = build_dataset(image_set='train', args=args)
@@ -182,9 +190,11 @@ def main(args):
     data_loader_val = DataLoader(dataset_val, 1, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
 
-    if args.onecyclelr:
-        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(data_loader_train), epochs=args.epochs, pct_start=0.2)
-    elif args.multi_step_lr:
+    # Warmup is iteration-based and completes within the first epoch so the
+    # epoch-based scheduler retains its expected state and resume semantics.
+    args.warmup_iters = min(args.warmup_iters, max(0, len(data_loader_train) - 1))
+
+    if args.scheduler == 'multistep':
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drop_list)
     else:
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
@@ -202,8 +212,6 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
-    if os.path.exists(os.path.join(args.output_dir, 'checkpoint.pth')):
-        args.resume = os.path.join(args.output_dir, 'checkpoint.pth')
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -277,12 +285,15 @@ def main(args):
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
 
-        if not args.onecyclelr:
-            lr_scheduler.step()
+        lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % args.save_checkpoint_interval == 0:
+            is_lr_drop = (
+                args.scheduler == 'step' and (epoch + 1) % args.lr_drop == 0
+            ) or (
+                args.scheduler == 'multistep' and (epoch + 1) in args.lr_drop_list
+            )
+            if is_lr_drop or (epoch + 1) % args.save_checkpoint_interval == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 weights = {
@@ -298,29 +309,35 @@ def main(args):
                     })
                 utils.save_on_master(weights, checkpoint_path)
                 
-        # eval
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
-            wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
+        should_evaluate = (
+            (epoch + 1) % args.evaluate_every_epochs == 0
+            or epoch + 1 == args.epochs
         )
-        map_regular = test_stats['coco_eval_bbox'][0]
-        _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
-        if _isbest:
-            checkpoint_path = output_dir / 'checkpoint_best_regular.pth'
-            utils.save_on_master({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'args': args,
-            }, checkpoint_path)
+        test_stats = {}
+        coco_evaluator = None
+        if should_evaluate:
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
+                wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
+            )
+            map_regular = test_stats['coco_eval_bbox'][0]
+            _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
+            if _isbest:
+                checkpoint_path = output_dir / 'checkpoint_best_regular.pth'
+                utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                }, checkpoint_path)
         log_stats = {
             **{f'train_{k}': v for k, v in train_stats.items()},
             **{f'test_{k}': v for k, v in test_stats.items()},
         }
 
         # eval ema
-        if args.use_ema:
+        if args.use_ema and should_evaluate:
             ema_test_stats, ema_coco_evaluator = evaluate(
                 ema_m.module, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
                 wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)

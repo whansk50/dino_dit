@@ -140,6 +140,9 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "lr": training["detector_lr"],
         "lr_backbone": training["backbone_lr"],
         "weight_decay": training["weight_decay"],
+        "warmup_iters": training["warmup_iters"],
+        "warmup_factor": training["warmup_factor"],
+        "evaluate_every_epochs": training["evaluate_every_epochs"],
         "dit_pretrained": str(config.pretrained) if config.pretrained else None,
         "dit_drop_path": config.dit["drop_path"],
         "dit_use_checkpoint": config.dit["use_checkpoint"],
@@ -148,6 +151,9 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "data_norm_mean": list(input_settings["mean"]),
         "data_norm_std": list(input_settings["std"]),
         "data_random_flip": input_settings["random_flip"],
+        "optimizer": detector["optimizer"],
+        "adam_betas": list(detector["adam_betas"]),
+        "scheduler": detector["scheduler"],
         "hidden_dim": detector["hidden_dim"],
         "num_feature_levels": detector["num_feature_levels"],
         "enc_layers": detector["enc_layers"],
@@ -161,12 +167,22 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "num_select": detector["num_select"],
         "use_dn": detector["use_dn"],
         "dn_number": detector["dn_number"],
+        "dn_box_noise_scale": detector["dn_box_noise_scale"],
+        "dn_label_noise_ratio": detector["dn_label_noise_ratio"],
+        "aux_loss": detector["aux_loss"],
         "lr_drop": detector["lr_drop_epoch"],
+        "lr_drop_list": list(detector["lr_drop_epochs"]),
         "clip_max_norm": detector["clip_max_norm"],
+        "set_cost_class": detector["set_cost_class"],
+        "set_cost_bbox": detector["set_cost_bbox"],
+        "set_cost_giou": detector["set_cost_giou"],
         "cls_loss_coef": detector["cls_loss_coef"],
         "bbox_loss_coef": detector["bbox_loss_coef"],
         "giou_loss_coef": detector["giou_loss_coef"],
         "focal_alpha": detector["focal_alpha"],
+        "use_ema": detector["use_ema"],
+        "ema_decay": detector["ema_decay"],
+        "ema_epoch": detector["ema_epoch"],
         "save_checkpoint_interval": training["checkpoint_every_epochs"],
     }
 
@@ -175,7 +191,9 @@ def _option(name: str, value: Any) -> str:
     if value is None:
         serialized = "None"
     elif isinstance(value, (list, tuple)):
-        serialized = ",".join(map(str, value))
+        # DINO's legacy DictAction collapses a one-item comma-separated value
+        # to a scalar, so retain brackets for empty and singleton sequences.
+        serialized = repr(list(value)) if len(value) <= 1 else ",".join(map(str, value))
     else:
         serialized = str(value)
     return f"{name}={serialized}"

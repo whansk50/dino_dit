@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -35,6 +37,25 @@ def sha256_file(path: str | Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _safe_torch_load(path: Path) -> object:
+    """Load legacy UniLM checkpoints while keeping PyTorch's safe unpickler.
+
+    Official DiT checkpoints contain training metadata represented by NumPy
+    scalars and ``argparse.Namespace``. PyTorch 2.6+ rejects those metadata
+    types by default even though the model tensors themselves are safe.
+    """
+    numpy_core = np._core if hasattr(np, "_core") else np.core
+    safe_globals = [
+        numpy_core.multiarray.scalar,
+        (numpy_core.multiarray.scalar, "numpy.core.multiarray.scalar"),
+        np.dtype,
+        type(np.dtype(np.float64)),
+        argparse.Namespace,
+    ]
+    with torch.serialization.safe_globals(safe_globals):
+        return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def _unwrap(checkpoint: object) -> dict[str, Tensor]:
@@ -94,7 +115,7 @@ def load_dit_pretrained(model: nn.Module, path: str | Path) -> LoadReport:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"DiT checkpoint not found: {path}")
-    raw = torch.load(path, map_location="cpu")
+    raw = _safe_torch_load(path)
     state = _unwrap(raw)
     model_state = model.state_dict()
     if "pos_embed" in state and "pos_embed" in model_state:

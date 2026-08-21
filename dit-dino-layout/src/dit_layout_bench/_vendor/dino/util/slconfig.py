@@ -314,7 +314,9 @@ class SLConfig(object):
             based_on_style='pep8',
             blank_line_before_nested_class_or_def=True,
             split_before_expression_after_opening_paren=True)
-        text, _ = FormatCode(text, style_config=yapf_style, verify=True)
+        # Modified for DiTLayoutBench: YAPF 0.43 removed the legacy
+        # ``verify`` keyword. Formatting already parses/validates the result.
+        text, _ = FormatCode(text, style_config=yapf_style)
 
         return text
     
@@ -432,9 +434,12 @@ class DictAction(Action):
         options = {}
         for kv in values:
             key, val = kv.split('=', maxsplit=1)
-            val = [self._parse_int_float_bool(v) for v in val.split(',')]
-            if len(val) == 1:
-                val = val[0]
+            if val.startswith('[') and val.endswith(']'):
+                import ast
+                val = ast.literal_eval(val)
+            else:
+                val = [self._parse_int_float_bool(v) for v in val.split(',')]
+                if len(val) == 1:
+                    val = val[0]
             options[key] = val
         setattr(namespace, self.dest, options)
-

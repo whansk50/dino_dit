@@ -1,9 +1,15 @@
+import argparse
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
+import numpy as np
+import torch
+
 from dit_layout_bench.config import RunConfig, load_settings
-from dit_layout_bench.cli import _config, _parser
-from dit_layout_bench.backends.dino import _runner_arguments
+from dit_layout_bench.cli import _config, _parser, _validated_config
+from dit_layout_bench.checkpoint import _safe_torch_load
+from dit_layout_bench.backends.dino import _activate_dino, _runner_arguments
 from dit_layout_bench.data import validate_publaynet
 from dit_layout_bench.optim import parameter_groups
 from dit_layout_bench.prediction import prediction_record
@@ -13,6 +19,17 @@ FIXTURE = Path(__file__).parent / "fixtures" / "publaynet"
 
 
 class ContractTests(unittest.TestCase):
+    def test_legacy_checkpoint_metadata_uses_safe_loader(self):
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "legacy.pth"
+            torch.save(
+                {"value": np.float64(1.25), "args": argparse.Namespace(epoch=1)},
+                checkpoint,
+            )
+            loaded = _safe_torch_load(checkpoint)
+            self.assertEqual(float(loaded["value"]), 1.25)
+            self.assertEqual(loaded["args"].epoch, 1)
+
     def test_category_mapping_round_trip(self):
         for category_id in range(1, 6):
             self.assertEqual(
@@ -122,6 +139,68 @@ class ContractTests(unittest.TestCase):
         self.assertIn("epochs=3", arguments)
         self.assertIn("num_queries=123", arguments)
         self.assertIn("data_norm_mean=0.5,0.5,0.5", arguments)
+        self.assertIn("warmup_iters=1000", arguments)
+        self.assertIn("evaluate_every_epochs=1", arguments)
+        self.assertIn("optimizer=adamw", arguments)
+        self.assertIn("adam_betas=0.9,0.999", arguments)
+        self.assertIn("set_cost_class=2.0", arguments)
+        self.assertIn("dn_box_noise_scale=0.4", arguments)
+        self.assertIn("use_ema=False", arguments)
+        self.assertIn("lr_drop_list=[11]", arguments)
+
+    def test_dino_option_parser_preserves_singleton_lists(self):
+        _activate_dino()
+        from util.slconfig import DictAction
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--options", nargs="+", action=DictAction)
+        args = parser.parse_args(["--options", "lr_drop_list=[11]"])
+        self.assertEqual(args.options["lr_drop_list"], [11])
+
+    def test_dino_resume_is_forwarded_only_when_explicit(self):
+        settings = load_settings()
+        without_resume = RunConfig(
+            "dino",
+            FIXTURE,
+            FIXTURE / "out",
+            None,
+            settings=settings,
+        )
+        self.assertNotIn("--resume", _runner_arguments(without_resume, evaluate=False))
+
+        checkpoint = FIXTURE / "detector.pth"
+        with_resume = RunConfig(
+            "dino",
+            FIXTURE,
+            FIXTURE / "out",
+            None,
+            resume=checkpoint,
+            settings=settings,
+        )
+        arguments = _runner_arguments(with_resume, evaluate=False)
+        resume_index = arguments.index("--resume")
+        self.assertEqual(arguments[resume_index + 1], str(checkpoint))
+
+    def test_resume_training_does_not_require_redundant_pretrained_path(self):
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint.pth"
+            checkpoint.touch()
+            args = _parser("train").parse_args(
+                [
+                    "--data-root",
+                    str(FIXTURE),
+                    "--resume",
+                    str(checkpoint),
+                ]
+            )
+            config = _validated_config(
+                _parser("train"),
+                args,
+                require_data=True,
+                require_pretrained=True,
+            )
+            self.assertIsNone(config.pretrained)
+            self.assertEqual(config.resume, checkpoint)
 
     def test_mlflow_settings_are_versioned_in_yaml(self):
         settings = load_settings()
