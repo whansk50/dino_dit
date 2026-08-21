@@ -195,8 +195,21 @@ class MetricLogger(object):
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):
-        for meter in self.meters.values():
-            meter.synchronize_between_processes()
+        if not is_dist_avail_and_initialized() or not self.meters:
+            return
+        names = sorted(self.meters)
+        totals = torch.tensor(
+            [
+                (self.meters[name].count, self.meters[name].total)
+                for name in names
+            ],
+            dtype=torch.float64,
+            device="cuda" if dist.get_backend() == "nccl" else "cpu",
+        )
+        dist.all_reduce(totals)
+        for index, name in enumerate(names):
+            self.meters[name].count = int(totals[index, 0].item())
+            self.meters[name].total = float(totals[index, 1].item())
 
     def add_meter(self, name, meter):
         self.meters[name] = meter
@@ -320,16 +333,20 @@ class NestedTensor(object):
             res.append(torch.Tensor([maxH, maxW]))
         return res
 
-    def to(self, device):
+    def to(self, device, non_blocking=False):
         # type: (Device) -> NestedTensor # noqa
-        cast_tensor = self.tensors.to(device)
+        cast_tensor = self.tensors.to(device, non_blocking=non_blocking)
         mask = self.mask
         if mask is not None:
             assert mask is not None
-            cast_mask = mask.to(device)
+            cast_mask = mask.to(device, non_blocking=non_blocking)
         else:
             cast_mask = None
         return NestedTensor(cast_tensor, cast_mask)
+
+    def pin_memory(self):
+        pinned_mask = self.mask.pin_memory() if self.mask is not None else None
+        return NestedTensor(self.tensors.pin_memory(), pinned_mask)
 
     def to_img_list_single(self, tensor, mask):
         assert tensor.dim() == 3, "dim of tensor should be 3 but {}".format(tensor.dim())
@@ -473,28 +490,25 @@ def save_on_master(*args, **kwargs):
 
 
 def init_distributed_mode(args):
-    if 'WORLD_SIZE' in os.environ and os.environ['WORLD_SIZE'] != '': # 'RANK' in os.environ and 
-        # args.rank = int(os.environ["RANK"])
-        # args.world_size = int(os.environ['WORLD_SIZE'])
-        # args.gpu = args.local_rank = int(os.environ['LOCAL_RANK'])
-
-        # launch by torch.distributed.launch
-        # Single node
-        #   python -m torch.distributed.launch --nproc_per_node=8 main.py --world-size 1 --rank 0 ...
-        # Multi nodes
-        #   python -m torch.distributed.launch --nproc_per_node=8 main.py --world-size 2 --rank 0 --dist-url 'tcp://IP_OF_NODE0:FREEPORT' ...
-        #   python -m torch.distributed.launch --nproc_per_node=8 main.py --world-size 2 --rank 1 --dist-url 'tcp://IP_OF_NODE0:FREEPORT' ...
-
-        local_world_size = int(os.environ['WORLD_SIZE'])
-        args.world_size = args.world_size * local_world_size
+    torchrun_keys = ('RANK', 'WORLD_SIZE', 'LOCAL_RANK')
+    present_torchrun_keys = [key for key in torchrun_keys if os.environ.get(key)]
+    if present_torchrun_keys:
+        missing = [key for key in torchrun_keys if not os.environ.get(key)]
+        if missing:
+            raise RuntimeError(
+                'Incomplete torchrun environment; missing {}'.format(', '.join(missing))
+            )
+        # torchrun already provides global rank/world size. Multiplying these
+        # values by parser defaults causes invalid ranks and initialization hangs.
+        args.rank = int(os.environ['RANK'])
+        args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = args.local_rank = int(os.environ['LOCAL_RANK'])
-        args.rank = args.rank * local_world_size + args.local_rank
-        print('world size: {}, rank: {}, local rank: {}'.format(args.world_size, args.rank, args.local_rank))
-        print(json.dumps(dict(os.environ), indent=2))
     elif 'SLURM_PROCID' in os.environ:
         args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.local_rank = int(os.environ['SLURM_LOCALID'])
-        args.world_size = int(os.environ['SLURM_NPROCS'])
+        args.gpu = args.local_rank = int(os.environ.get('SLURM_LOCALID', 0))
+        args.world_size = int(
+            os.environ.get('SLURM_NTASKS', os.environ.get('SLURM_NPROCS', 1))
+        )
 
         print('world size: {}, world rank: {}, local rank: {}, device_count: {}'.format(args.world_size, args.rank, args.local_rank, torch.cuda.device_count()))
     else:
@@ -505,16 +519,37 @@ def init_distributed_mode(args):
         args.local_rank = 0
         return
 
+    if args.world_size < 1 or not 0 <= args.rank < args.world_size:
+        raise RuntimeError(
+            'Invalid distributed topology: world_size={}, rank={}'.format(
+                args.world_size, args.rank
+            )
+        )
+    if args.world_size == 1:
+        print('Launcher world size is 1; using single-process mode')
+        args.distributed = False
+        return
+
     print("world_size:{} rank:{} local_rank:{}".format(args.world_size, args.rank, args.local_rank))
     args.distributed = True
-    torch.cuda.set_device(args.local_rank)
-    args.dist_backend = 'nccl'
+    if str(args.device).startswith('cuda'):
+        if not torch.cuda.is_available():
+            raise RuntimeError('Distributed CUDA training requested, but CUDA is unavailable')
+        if args.local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                'LOCAL_RANK={} exceeds visible CUDA device count {}'.format(
+                    args.local_rank, torch.cuda.device_count()
+                )
+            )
+        torch.cuda.set_device(args.local_rank)
+        args.device = 'cuda:{}'.format(args.local_rank)
+        args.dist_backend = 'nccl'
+    else:
+        args.dist_backend = 'gloo'
     print('| distributed init (rank {}): {}'.format(args.rank, args.dist_url), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                          world_size=args.world_size, rank=args.rank)
-    print("Before torch.distributed.barrier()")
     torch.distributed.barrier()
-    print("End torch.distributed.barrier()")
     setup_for_distributed(args.rank == 0)
 
 

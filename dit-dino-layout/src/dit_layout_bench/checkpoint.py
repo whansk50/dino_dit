@@ -39,7 +39,7 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _safe_torch_load(path: Path) -> object:
+def safe_torch_load(path: str | Path) -> object:
     """Load legacy UniLM checkpoints while keeping PyTorch's safe unpickler.
 
     Official DiT checkpoints contain training metadata represented by NumPy
@@ -55,7 +55,47 @@ def _safe_torch_load(path: Path) -> object:
         argparse.Namespace,
     ]
     with torch.serialization.safe_globals(safe_globals):
-        return torch.load(path, map_location="cpu", weights_only=True)
+        return torch.load(Path(path), map_location="cpu", weights_only=True)
+
+
+# Kept for compatibility with existing callers and tests.
+_safe_torch_load = safe_torch_load
+
+
+def validate_reduced_pyramid_checkpoint(
+    checkpoint: object, *, expected_channels: int
+) -> None:
+    """Reject detector checkpoints from the legacy 768-channel FPN clearly."""
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Detector checkpoint must contain a mapping")
+    state = checkpoint.get("model", checkpoint)
+    if not isinstance(state, Mapping):
+        raise TypeError("Detector checkpoint model state must contain a mapping")
+    projection = next(
+        (
+            value
+            for key, value in state.items()
+            if isinstance(key, str)
+            and key.endswith("pyramid.projections.0.weight")
+            and isinstance(value, Tensor)
+        ),
+        None,
+    )
+    if projection is None:
+        raise RuntimeError(
+            "This detector checkpoint uses the legacy 768-channel FPN. The current "
+            "pyramid inserts learned 768-to-256 projections before upsampling, so "
+            "pyramid, DINO input-projection, and optimizer-state shapes are not "
+            "resume-compatible. Start a new detector run from the DiT pretrained "
+            "checkpoint; the DiT encoder weights themselves remain compatible."
+        )
+    actual_channels = int(projection.shape[0])
+    if actual_channels != expected_channels:
+        raise RuntimeError(
+            "Detector checkpoint pyramid width does not match the current config: "
+            f"checkpoint={actual_channels}, config={expected_channels}. Full resume "
+            "requires the same dit.pyramid_channels value."
+        )
 
 
 def _unwrap(checkpoint: object) -> dict[str, Tensor]:
@@ -115,7 +155,7 @@ def load_dit_pretrained(model: nn.Module, path: str | Path) -> LoadReport:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"DiT checkpoint not found: {path}")
-    raw = _safe_torch_load(path)
+    raw = safe_torch_load(path)
     state = _unwrap(raw)
     model_state = model.state_dict()
     if "pos_embed" in state and "pos_embed" in model_state:

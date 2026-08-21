@@ -21,25 +21,38 @@ class DiTFeaturePyramid(nn.Module):
 
     size_divisibility = 32
 
-    def __init__(self, backbone: DiTBase | None = None) -> None:
+    def __init__(
+        self, backbone: DiTBase | None = None, *, out_channels: int = 256
+    ) -> None:
         super().__init__()
+        if out_channels < 1:
+            raise ValueError("out_channels must be positive")
         self.backbone = backbone or DiTBase()
         dim = self.backbone.embed_dim
+        # Reduce channels while features are still stride-16. The legacy
+        # pyramid upsampled all 768 DiT channels and only then let DINO project
+        # them to 256, which was especially expensive for P2.
+        self.projections = nn.ModuleList(
+            [nn.Conv2d(dim, out_channels, 1) for _ in FEATURE_NAMES]
+        )
         self.transforms = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.ConvTranspose2d(dim, dim, 2, 2),
-                    nn.BatchNorm2d(dim),
+                    nn.ConvTranspose2d(out_channels, out_channels, 2, 2),
+                    nn.BatchNorm2d(out_channels),
                     nn.GELU(),
-                    nn.ConvTranspose2d(dim, dim, 2, 2),
+                    nn.ConvTranspose2d(out_channels, out_channels, 2, 2),
                 ),
-                nn.ConvTranspose2d(dim, dim, 2, 2),
+                nn.ConvTranspose2d(out_channels, out_channels, 2, 2),
                 nn.Identity(),
                 nn.MaxPool2d(2, 2),
             ]
         )
-        self.num_channels = [dim] * 4
+        self.num_channels = [out_channels] * 4
         self.strides = list(FEATURE_STRIDES)
+
+        # TODO: Compare PubLayNet COCO AP-small against the legacy 768-channel
+        # pyramid before treating this architecture as the final baseline.
 
     @staticmethod
     def pad(images: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
@@ -71,10 +84,14 @@ class DiTFeaturePyramid(nn.Module):
         taps = self.backbone(images)
         features: OrderedDict[str, Tensor] = OrderedDict()
         masks: OrderedDict[str, Tensor] = OrderedDict()
-        for name, tap, transform, stride in zip(
-            FEATURE_NAMES, taps.values(), self.transforms, FEATURE_STRIDES
+        for name, tap, projection, transform, stride in zip(
+            FEATURE_NAMES,
+            taps.values(),
+            self.projections,
+            self.transforms,
+            FEATURE_STRIDES,
         ):
-            feature = transform(tap)
+            feature = transform(projection(tap))
             expected = (images.shape[-2] // stride, images.shape[-1] // stride)
             if feature.shape[-2:] != expected:
                 raise RuntimeError(

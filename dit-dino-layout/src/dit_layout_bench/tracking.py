@@ -5,10 +5,38 @@ from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass
 import math
+import os
 from typing import Any, Mapping
 
 
 _ACTIVE: ContextVar["MLflowTracker | None"] = ContextVar("mlflow_tracker", default=None)
+
+
+def process_rank() -> int:
+    """Return the launcher-provided global rank before torch.distributed starts."""
+    for name in ("RANK", "SLURM_PROCID"):
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except ValueError as error:
+                raise RuntimeError(f"{name} must be an integer, got {value!r}") from error
+    return 0
+
+
+def process_world_size() -> int:
+    """Return the launcher-provided world size, defaulting to one process."""
+    for name in ("WORLD_SIZE", "SLURM_NTASKS", "SLURM_NPROCS"):
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            try:
+                world_size = int(value)
+            except ValueError as error:
+                raise RuntimeError(f"{name} must be an integer, got {value!r}") from error
+            if world_size < 1:
+                raise RuntimeError(f"{name} must be positive, got {world_size}")
+            return world_size
+    return 1
 
 
 def _flatten(values: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -37,7 +65,9 @@ class MLflowTracker:
 
     def __enter__(self) -> "MLflowTracker":
         self._token = _ACTIVE.set(self)
-        if not self.enabled:
+        # The tracker is created before DINO initializes torch.distributed, so
+        # use torchrun/Slurm environment variables to keep MLflow rank-zero-only.
+        if not self.enabled or process_rank() != 0:
             return self
         try:
             import mlflow
@@ -53,9 +83,21 @@ class MLflowTracker:
         run_name = self.config.tracking["run_name"] or None
         mlflow.start_run(
             run_name=run_name,
-            tags={"detector": self.config.detector, "action": self.action},
+            tags={
+                "detector": self.config.detector,
+                "action": self.action,
+                "distributed": str(process_world_size() > 1).lower(),
+            },
         )
         mlflow.log_params(_flatten(self.config.settings))
+        mlflow.log_params(
+            {
+                "runtime.world_size": process_world_size(),
+                "runtime.global_batch_size": (
+                    self.config.batch_size * process_world_size()
+                ),
+            }
+        )
         mlflow.log_dict(self.config.settings, "effective-config.yaml")
         return self
 

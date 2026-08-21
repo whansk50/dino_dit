@@ -14,6 +14,7 @@ from typing import Sequence
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 
@@ -70,9 +71,19 @@ class Attention(nn.Module):
         qkv = F.linear(x, self.qkv.weight, bias)
         qkv = qkv.reshape(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        attention = ((q * self.scale) @ k.transpose(-2, -1)).softmax(dim=-1)
-        attention = self.attn_drop(attention)
-        output = (attention @ v).transpose(1, 2).reshape(batch, tokens, channels)
+        if q.is_cuda and q.dtype == torch.float16:
+            # Training AMP is intentionally FP16-only for now. Requiring the
+            # Flash backend here prevents a silent fallback to the quadratic
+            # materialized attention path on supported NVIDIA GPUs.
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                output = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=0.0, scale=self.scale
+                )
+        else:
+            output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, scale=self.scale
+            )
+        output = output.transpose(1, 2).reshape(batch, tokens, channels)
         return self.proj_drop(self.proj(output))
 
 

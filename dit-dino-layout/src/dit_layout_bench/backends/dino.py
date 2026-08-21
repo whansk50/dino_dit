@@ -61,7 +61,9 @@ def build_dino_backbone(args):
             if args.dit_pretrained:
                 report = load_dit_pretrained(encoder, args.dit_pretrained)
                 print(f"DiT checkpoint: {report.summary()}")
-            self.pyramid = DiTFeaturePyramid(encoder)
+            self.pyramid = DiTFeaturePyramid(
+                encoder, out_channels=args.dit_pyramid_channels
+            )
             self.num_channels = self.pyramid.num_channels
 
         def forward(self, samples: NestedTensor):
@@ -146,12 +148,14 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "dit_pretrained": str(config.pretrained) if config.pretrained else None,
         "dit_drop_path": config.dit["drop_path"],
         "dit_use_checkpoint": config.dit["use_checkpoint"],
+        "dit_pyramid_channels": config.dit["pyramid_channels"],
         "data_aug_scales": list(input_settings["short_edge_scales"]),
         "data_aug_max_size": input_settings["max_long_edge"],
         "data_norm_mean": list(input_settings["mean"]),
         "data_norm_std": list(input_settings["std"]),
         "data_random_flip": input_settings["random_flip"],
         "optimizer": detector["optimizer"],
+        "fused_optimizer": detector["fused_optimizer"],
         "adam_betas": list(detector["adam_betas"]),
         "scheduler": detector["scheduler"],
         "hidden_dim": detector["hidden_dim"],
@@ -184,6 +188,13 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "ema_decay": detector["ema_decay"],
         "ema_epoch": detector["ema_epoch"],
         "save_checkpoint_interval": training["checkpoint_every_epochs"],
+        "data_pin_memory": training["pin_memory"],
+        "data_non_blocking": training["non_blocking"],
+        "data_persistent_workers": training["persistent_workers"],
+        "data_prefetch_factor": training["prefetch_factor"],
+        "tracking_log_every_steps": config.tracking["log_every_steps"],
+        "ddp_gradient_as_bucket_view": detector["ddp_gradient_as_bucket_view"],
+        "ddp_static_graph": detector["ddp_static_graph"],
     }
 
 
@@ -297,8 +308,16 @@ def run(config, *, evaluate: bool = False) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     parser = dino_main.get_args_parser()
     args = parser.parse_args(_runner_arguments(config, evaluate=evaluate))
-    with _patched_dino_runtime(dino_main, dino_model):
-        dino_main.main(args)
+    try:
+        with _patched_dino_runtime(dino_main, dino_model):
+            dino_main.main(args)
+    finally:
+        # This runner is imported by the shared CLI rather than executed as a
+        # standalone script, so explicitly release torchrun's process group.
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def train(config) -> None:
@@ -332,7 +351,15 @@ def predict(config, image_path: Path, *, score_threshold: float = 0.5):
         model, _, postprocessors = dino_main.build_model_main(args)
     finally:
         dino_model.build_backbone = original_backbone
-    checkpoint = torch.load(config.resume, map_location="cpu")
+    from dit_layout_bench.checkpoint import (
+        safe_torch_load,
+        validate_reduced_pyramid_checkpoint,
+    )
+
+    checkpoint = safe_torch_load(config.resume)
+    validate_reduced_pyramid_checkpoint(
+        checkpoint, expected_channels=config.dit["pyramid_channels"]
+    )
     model.load_state_dict(checkpoint.get("model", checkpoint), strict=True)
     model.to(config.device).eval()
 

@@ -89,7 +89,8 @@ RGB → horizontal flip(train) → short edge 480..800 / long edge ≤1333
 `--options training.batch_size=4`와 같은 override를 사용한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python train.py --config configs/dino_train.yaml
+CUDA_VISIBLE_DEVICES=2 torchrun --standalone --nproc-per-node=gpu \
+  --numa-binding=node train.py --config configs/dino_train.yaml
 ```
 
 ## 7. 학습, 평가, 추론
@@ -97,14 +98,19 @@ CUDA_VISIBLE_DEVICES=2 python train.py --config configs/dino_train.yaml
 ```bash
 python train.py --config configs/dino_train.yaml
 
+# 보이는 GPU 수에 따라 single/DDP 자동 선택 (DINO backend)
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=gpu \
+  --numa-binding=node \
+  train.py --config configs/dino_train.yaml
+
 # 완료된 마지막 epoch부터 명시적으로 학습 재개
 python train.py --config configs/dino_train.yaml \
-  --resume outputs/dino/checkpoint.pth
+  --resume outputs/dino-fpn256/checkpoint.pth
 
 python evaluate.py --detector dino --data-root /data/publaynet \
-  --resume outputs/dino/checkpoint.pth
+  --resume outputs/dino-fpn256/checkpoint.pth
 
-python inference.py --detector dino --resume outputs/dino/checkpoint.pth \
+python inference.py --detector dino --resume outputs/dino-fpn256/checkpoint.pth \
   --image page.jpg --json-output prediction.json
 ```
 
@@ -112,6 +118,34 @@ python inference.py --detector dino --resume outputs/dino/checkpoint.pth \
 복원한다. resume에는 detector 전체 가중치가 있으므로 `paths.pretrained`는
 생략할 수 있다. 출력 디렉터리에 기존 `checkpoint.pth`가 있더라도
 `--resume`을 생략하면 pretrained 가중치에서 새 학습을 시작한다.
+
+DDP는 `torchrun`의 `RANK`, `WORLD_SIZE`, `LOCAL_RANK`를 감지해 자동 활성화된다.
+일반 `python train.py ...` 실행은 기존 단일 GPU 동작을 유지한다. DINO의
+`training.batch_size`와 `run.num_workers`는 GPU(process)당 값이므로 위 2-GPU
+예제의 global batch는 `2 × training.batch_size`이고 DataLoader worker 수도
+전체적으로 `2 × run.num_workers`가 된다. global batch가 달라지면 learning
+rate와 수렴 특성이 달라질 수 있으므로 동일 조건 비교 시 이를 함께 기록한다.
+checkpoint, config, log 및 MLflow run은 global rank 0만 기록하고, 평가 예측과
+loss 통계는 모든 rank에서 모은다. 같은 pyramid 설정의 DDP checkpoint는 단일
+GPU와 상호 호환된다.
+
+현재 서버는 NVLink가 연결되어 있지 않고 GPU `0,1`과 `2,3`이 각각 같은 NUMA
+측에 있다. 2-GPU 실행은 `CUDA_VISIBLE_DEVICES=0,1` 또는 `2,3`을 사용하고
+`--numa-binding=node`를 유지한다. GPU 선택은 launcher/scheduler의 자원 할당
+영역이므로 학습 코드가 임의로 바꾸지 않는다.
+
+현재 pyramid는 네 stride-16 DiT tap을 먼저 768→256으로 projection한 뒤
+P2/P3/P4/P5로 변환한다. 이전 768채널 pyramid와는 projection 및 transposed-conv
+parameter shape가 다르고 DINO 입력 projection과 optimizer state도 달라서, 이전
+detector checkpoint를 `--resume`할 수 없다. 오류 시 이를 명시적으로 안내한다.
+DiT encoder 자체의 parameter shape는 바뀌지 않았으므로 동일한 self-supervised
+`paths.pretrained`에서 새 output directory로 학습을 시작할 수 있다. AP-small
+회귀 비교 조건은 [TODO.md](TODO.md)에 기록했다.
+
+DataLoader는 pinned memory와 non-blocking H2D를 사용하고 train worker만 epoch
+사이에 유지한다. `training.batch_size`, `run.num_workers`, prefetch는 rank당
+값이다. Adam/AdamW fused optimizer는 CUDA에서만 켜고, DDP는 gradient bucket
+view와 static graph를 사용한다. AMP dtype은 FP16으로 고정한다.
 
 DINO의 linear warmup은 첫 epoch 안에서 `training.warmup_iters`만큼 적용된다.
 평가는 `training.evaluate_every_epochs` 주기와 마지막 epoch에 실행한다.

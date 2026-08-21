@@ -61,13 +61,13 @@ class CocoClassMapper():
     def compact2origin(self, idx):
         return self.compact2origin_mapper[int(idx)]
 
-def to_device(item, device):
+def to_device(item, device, non_blocking=False):
     if isinstance(item, torch.Tensor):
-        return item.to(device)
+        return item.to(device, non_blocking=non_blocking)
     elif isinstance(item, list):
-        return [to_device(i, device) for i in item]
+        return [to_device(i, device, non_blocking) for i in item]
     elif isinstance(item, dict):
-        return {k: to_device(v, device) for k,v in item.items()}
+        return {k: to_device(v, device, non_blocking) for k,v in item.items()}
     else:
         raise NotImplementedError("Call Shilong if you use other containers! type: {}".format(type(item)))
 

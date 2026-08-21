@@ -68,10 +68,14 @@ def _register_backbone(api: CascadeAPI) -> None:
             if cfg.MODEL.DIT.PRETRAINED:
                 report = load_dit_pretrained(encoder, cfg.MODEL.DIT.PRETRAINED)
                 print(f"DiT checkpoint: {report.summary()}")
-            self.pyramid = DiTFeaturePyramid(encoder)
+            self.pyramid = DiTFeaturePyramid(
+                encoder, out_channels=cfg.MODEL.DIT.PYRAMID_CHANNELS
+            )
             self._size_divisibility = self.pyramid.size_divisibility
             self._out_features = list(FEATURE_NAMES)
-            self._out_feature_channels = dict.fromkeys(FEATURE_NAMES, encoder.embed_dim)
+            self._out_feature_channels = dict.fromkeys(
+                FEATURE_NAMES, cfg.MODEL.DIT.PYRAMID_CHANNELS
+            )
             self._out_feature_strides = dict(zip(FEATURE_NAMES, FEATURE_STRIDES))
 
         def forward(self, images):
@@ -113,6 +117,7 @@ def _build_cfg(api: CascadeAPI, config):
     cfg.MODEL.DIT.PRETRAINED = str(config.pretrained) if config.pretrained else ""
     cfg.MODEL.DIT.DROP_PATH = config.dit["drop_path"]
     cfg.MODEL.DIT.USE_CHECKPOINT = config.dit["use_checkpoint"]
+    cfg.MODEL.DIT.PYRAMID_CHANNELS = config.dit["pyramid_channels"]
     cfg.MODEL.WEIGHTS = str(config.resume) if config.resume else ""
     cfg.MODEL.BACKBONE.NAME = "build_clean_dit_backbone"
     cfg.MODEL.PIXEL_MEAN = [value * 255 for value in input_settings["mean"]]
@@ -234,6 +239,16 @@ def run(config, *, evaluate: bool = False) -> None:
     _register_backbone(api)
     _register_data(api, config.data_root)
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    if config.resume is not None:
+        from dit_layout_bench.checkpoint import (
+            safe_torch_load,
+            validate_reduced_pyramid_checkpoint,
+        )
+
+        checkpoint = safe_torch_load(config.resume)
+        validate_reduced_pyramid_checkpoint(
+            checkpoint, expected_channels=config.dit["pyramid_channels"]
+        )
     cfg = _build_cfg(api, config)
     Trainer = _build_trainer(api, config)
     if evaluate:

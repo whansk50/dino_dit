@@ -21,6 +21,10 @@ import util.misc as utils
 import datasets
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch, test
+from dit_layout_bench.checkpoint import (
+    safe_torch_load,
+    validate_reduced_pyramid_checkpoint,
+)
 
 
 
@@ -68,7 +72,10 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--rank', default=0, type=int,
                         help='number of distributed processes')
-    parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
+    parser.add_argument(
+        "--local-rank", "--local_rank", dest="local_rank", type=int,
+        help='local rank for DistributedDataParallel',
+    )
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
     
@@ -152,7 +159,13 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            find_unused_parameters=args.find_unused_params,
+            gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+            static_graph=args.ddp_static_graph,
+        )
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info('number of params:'+str(n_parameters))
@@ -164,11 +177,20 @@ def main(args):
         'adam': torch.optim.Adam,
         'adamw': torch.optim.AdamW,
     }[args.optimizer]
+    fused_optimizer = bool(args.fused_optimizer and device.type == 'cuda')
     optimizer = optimizer_class(
         param_dicts,
         lr=args.lr,
         betas=tuple(args.adam_betas),
         weight_decay=args.weight_decay,
+        fused=fused_optimizer,
+    )
+    logger.info('fused optimizer: {}'.format(fused_optimizer))
+
+    # AMP precision is deliberately fixed to FP16 until the deformable
+    # attention CUDA operator has an explicitly validated BF16 path.
+    scaler = torch.amp.GradScaler(
+        'cuda', enabled=bool(args.amp and device.type == 'cuda')
     )
     
 
@@ -176,7 +198,7 @@ def main(args):
     dataset_val = build_dataset(image_set='val', args=args)
 
     if args.distributed:
-        sampler_train = DistributedSampler(dataset_train)
+        sampler_train = DistributedSampler(dataset_train, seed=args.seed)
         sampler_val = DistributedSampler(dataset_val, shuffle=False)
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
@@ -185,10 +207,30 @@ def main(args):
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
 
-    data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                                   collate_fn=utils.collate_fn, num_workers=args.num_workers)
-    data_loader_val = DataLoader(dataset_val, 1, sampler=sampler_val,
-                                 drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
+    loader_options = {
+        'collate_fn': utils.collate_fn,
+        'num_workers': args.num_workers,
+        'pin_memory': args.data_pin_memory,
+    }
+    if args.num_workers > 0:
+        loader_options['prefetch_factor'] = args.data_prefetch_factor
+    train_loader_options = dict(loader_options)
+    if args.num_workers > 0:
+        train_loader_options['persistent_workers'] = args.data_persistent_workers
+    data_loader_train = DataLoader(
+        dataset_train,
+        batch_sampler=batch_sampler_train,
+        **train_loader_options,
+    )
+    # Do not retain a second pool of workers beside the persistent training
+    # pool: every process already holds the large COCO annotation object.
+    data_loader_val = DataLoader(
+        dataset_val,
+        1,
+        sampler=sampler_val,
+        drop_last=False,
+        **loader_options,
+    )
 
     # Warmup is iteration-based and completes within the first epoch so the
     # epoch-based scheduler retains its expected state and resume semantics.
@@ -208,7 +250,7 @@ def main(args):
         base_ds = get_coco_api_from_dataset(dataset_val)
 
     if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
+        checkpoint = safe_torch_load(args.frozen_weights)
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
@@ -217,7 +259,10 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = safe_torch_load(args.resume)
+        validate_reduced_pyramid_checkpoint(
+            checkpoint, expected_channels=args.dit_pyramid_channels
+        )
         model_without_ddp.load_state_dict(checkpoint['model'])
         if args.use_ema:
             if 'ema_model' in checkpoint:
@@ -229,10 +274,12 @@ def main(args):
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
             args.start_epoch = checkpoint['epoch'] + 1
 
     if (not args.resume) and args.pretrain_model_path:
-        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu')['model']
+        checkpoint = safe_torch_load(args.pretrain_model_path)['model']
         from collections import OrderedDict
         _ignorekeywordlist = args.finetune_ignore if args.finetune_ignore else []
         ignorelist = []
@@ -281,7 +328,10 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm, wo_class_error=wo_class_error, lr_scheduler=lr_scheduler, args=args, logger=(logger if args.save_log else None), ema_m=ema_m)
+            args.clip_max_norm, wo_class_error=wo_class_error,
+            lr_scheduler=lr_scheduler, args=args,
+            logger=(logger if args.save_log else None), ema_m=ema_m,
+            scaler=scaler)
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
 
@@ -300,6 +350,7 @@ def main(args):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
                     'epoch': epoch,
                     'args': args,
                 }
@@ -328,6 +379,7 @@ def main(args):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)
@@ -351,6 +403,7 @@ def main(args):
                     'model': ema_m.module.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)

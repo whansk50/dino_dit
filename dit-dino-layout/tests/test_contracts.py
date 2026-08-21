@@ -1,7 +1,9 @@
 import argparse
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -14,6 +16,7 @@ from dit_layout_bench.data import validate_publaynet
 from dit_layout_bench.optim import parameter_groups
 from dit_layout_bench.prediction import prediction_record
 from dit_layout_bench.spec import category_id_to_train_label, train_label_to_category_id
+from dit_layout_bench.tracking import process_rank, process_world_size
 
 FIXTURE = Path(__file__).parent / "fixtures" / "publaynet"
 
@@ -142,11 +145,19 @@ class ContractTests(unittest.TestCase):
         self.assertIn("warmup_iters=1000", arguments)
         self.assertIn("evaluate_every_epochs=1", arguments)
         self.assertIn("optimizer=adamw", arguments)
+        self.assertIn("fused_optimizer=True", arguments)
         self.assertIn("adam_betas=0.9,0.999", arguments)
         self.assertIn("set_cost_class=2.0", arguments)
         self.assertIn("dn_box_noise_scale=0.4", arguments)
         self.assertIn("use_ema=False", arguments)
         self.assertIn("lr_drop_list=[11]", arguments)
+        self.assertIn("dit_pyramid_channels=256", arguments)
+        self.assertIn("data_pin_memory=True", arguments)
+        self.assertIn("data_non_blocking=True", arguments)
+        self.assertIn("data_persistent_workers=True", arguments)
+        self.assertIn("data_prefetch_factor=2", arguments)
+        self.assertIn("ddp_gradient_as_bucket_view=True", arguments)
+        self.assertIn("ddp_static_graph=True", arguments)
 
     def test_dino_option_parser_preserves_singleton_lists(self):
         _activate_dino()
@@ -206,6 +217,39 @@ class ContractTests(unittest.TestCase):
         settings = load_settings()
         self.assertIs(settings["tracking"]["enabled"], True)
         self.assertEqual(settings["tracking"]["experiment_name"], "dit-dino-publaynet")
+
+    def test_tracking_reads_torchrun_topology_before_process_group_init(self):
+        environment = {"RANK": "3", "WORLD_SIZE": "8", "LOCAL_RANK": "1"}
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(process_rank(), 3)
+            self.assertEqual(process_world_size(), 8)
+
+    def test_tracking_defaults_to_single_process(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(process_rank(), 0)
+            self.assertEqual(process_world_size(), 1)
+
+    def test_torchrun_rejects_backend_without_ddp_integration(self):
+        environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        parser = _parser("train")
+        args = parser.parse_args(
+            [
+                "--detector",
+                "cascade_rcnn",
+                "--data-root",
+                str(FIXTURE),
+                "--pretrained",
+                str(Path(__file__)),
+            ]
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(SystemExit):
+                _validated_config(
+                    parser,
+                    args,
+                    require_data=True,
+                    require_pretrained=True,
+                )
 
 
 if __name__ == "__main__":

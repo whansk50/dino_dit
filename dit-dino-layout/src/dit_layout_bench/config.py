@@ -130,6 +130,8 @@ def _validate_settings(settings: Mapping[str, Any]) -> None:
     for key in ("checkpoint_every_epochs", "evaluate_every_epochs"):
         if not isinstance(training[key], int) or training[key] < 1:
             raise ValueError(f"training.{key} must be a positive integer")
+    if training["prefetch_factor"] < 1:
+        raise ValueError("training.prefetch_factor must be a positive integer")
     if training["warmup_iters"] < 0:
         raise ValueError("training.warmup_iters must be non-negative")
     for key in ("detector_lr", "backbone_lr", "weight_decay", "warmup_factor"):
@@ -197,6 +199,9 @@ def _validate_settings(settings: Mapping[str, Any]) -> None:
             raise ValueError(f"dino.{key} must be non-negative")
     if not 0 <= dino["focal_alpha"] <= 1:
         raise ValueError("dino.focal_alpha must be between 0 and 1")
+
+    if settings["dit"]["pyramid_channels"] < 1:
+        raise ValueError("dit.pyramid_channels must be positive")
 
     cascade = settings["cascade"]
     if len(cascade["anchor_sizes"]) != 4:

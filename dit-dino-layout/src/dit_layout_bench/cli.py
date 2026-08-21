@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dit_layout_bench.backends import get_backend
 from dit_layout_bench.config import DEFAULT_CONFIG, DETECTORS, RunConfig, load_settings
-from dit_layout_bench.tracking import MLflowTracker
+from dit_layout_bench.tracking import MLflowTracker, process_world_size
 
 
 def _parser(action: str) -> argparse.ArgumentParser:
@@ -104,6 +104,10 @@ def _validated_config(
             )
         if require_resume and config.resume is None:
             raise ValueError("This command requires --resume or paths.resume in the config")
+        if process_world_size() > 1 and config.detector != "dino":
+            raise ValueError(
+                "torchrun DDP is currently supported only for --detector dino"
+            )
         return config
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))

@@ -25,8 +25,10 @@ TRAIN_STEP_CALLBACK = None
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, 
-                    wo_class_error=False, lr_scheduler=None, args=None, logger=None, ema_m=None):
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+                    wo_class_error=False, lr_scheduler=None, args=None, logger=None,
+                    ema_m=None, scaler=None):
+    if scaler is None:
+        raise ValueError("train_one_epoch requires a persistent GradScaler")
 
     try:
         need_tgt_for_training = args.use_dn
@@ -51,10 +53,21 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             for group in optimizer.param_groups:
                 group['lr'] = group['initial_lr'] * factor
 
-        samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        optimizer.zero_grad(set_to_none=True)
+        samples = samples.to(device, non_blocking=args.data_non_blocking)
+        targets = [
+            {
+                key: value.to(device, non_blocking=args.data_non_blocking)
+                for key, value in target.items()
+            }
+            for target in targets
+        ]
 
-        with torch.cuda.amp.autocast(enabled=args.amp):
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=bool(args.amp and device.type == "cuda"),
+        ):
             if need_tgt_for_training:
                 outputs = model(samples, targets)
             else:
@@ -65,8 +78,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
-        # reduce losses over all GPUs for logging purposes
-        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        global_step = epoch * len(data_loader) + _cnt
+        should_sync_metrics = (
+            _cnt % print_freq == 0
+            or global_step % args.tracking_log_every_steps == 0
+            or _cnt == len(data_loader) - 1
+        )
+        # Full loss synchronization is logging-only. Avoid putting this small,
+        # latency-bound collective in front of every DDP backward pass.
+        loss_dict_reduced = (
+            utils.reduce_dict(loss_dict) if should_sync_metrics else loss_dict
+        )
         loss_dict_reduced_unscaled = {f'{k}_unscaled': v
                                       for k, v in loss_dict_reduced.items()}
         loss_dict_reduced_scaled = {k: v * weight_dict[k]
@@ -75,15 +97,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         loss_value = losses_reduced_scaled.item()
 
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            print(loss_dict_reduced)
+        local_loss_value = losses.detach().item()
+        if not math.isfinite(local_loss_value):
+            print("Loss is {}, stopping training".format(local_loss_value))
+            print(loss_dict)
             sys.exit(1)
 
 
         # amp backward function
         if args.amp:
-            optimizer.zero_grad()
             scaler.scale(losses).backward()
             if max_norm > 0:
                 scaler.unscale_(optimizer)
@@ -92,7 +114,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             scaler.update()
         else:
             # original backward function
-            optimizer.zero_grad()
             losses.backward()
             if max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
@@ -118,7 +139,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             }
             if len(optimizer.param_groups) > 1:
                 step_metrics["lr_backbone"] = optimizer.param_groups[1]["lr"]
-            global_step = epoch * len(data_loader) + _cnt
             TRAIN_STEP_CALLBACK(step_metrics, global_step)
 
         _cnt += 1
@@ -179,12 +199,22 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     _cnt = 0
     output_state_dict = {} # for debug only
     for samples, targets in metric_logger.log_every(data_loader, 10, header, logger=logger):
-        samples = samples.to(device)
+        samples = samples.to(device, non_blocking=args.data_non_blocking)
 
         # targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        targets = [{k: to_device(v, device) for k, v in t.items()} for t in targets]
+        targets = [
+            {
+                key: to_device(value, device, args.data_non_blocking)
+                for key, value in target.items()
+            }
+            for target in targets
+        ]
 
-        with torch.cuda.amp.autocast(enabled=args.amp):
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=bool(args.amp and device.type == "cuda"),
+        ):
             if need_tgt_for_training:
                 outputs = model(samples, targets)
             else:
@@ -194,8 +224,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
-        # reduce losses over all GPUs for logging purposes
-        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        # Exact global averages are synchronized once at epoch end; reduce
+        # periodic display values only instead of every validation step.
+        loss_dict_reduced = (
+            utils.reduce_dict(loss_dict) if _cnt % 10 == 0 else loss_dict
+        )
         loss_dict_reduced_scaled = {k: v * weight_dict[k]
                                     for k, v in loss_dict_reduced.items() if k in weight_dict}
         loss_dict_reduced_unscaled = {f'{k}_unscaled': v

@@ -2,17 +2,17 @@ run:
   detector: dino
   device: cuda
   seed: 42
-  num_workers: 4
+  num_workers: 8
   amp: true
 
 paths:
   data_root: ../publaynet
-  output_dir: outputs/dino
+  output_dir: outputs/dino-fpn256
   pretrained: /workspace/boin-dit/boinDiT/pretrained_model/dit-base-224-p16-500k-62d53a.pth
   resume: ""
 
 training:
-  batch_size: 2
+  batch_size: 3
   epochs: 12
   detector_lr: 1.0e-4
   backbone_lr: 1.0e-5
@@ -21,6 +21,10 @@ training:
   warmup_factor: 0.001
   checkpoint_every_epochs: 1
   evaluate_every_epochs: 1
+  pin_memory: true
+  non_blocking: true
+  persistent_workers: true
+  prefetch_factor: 2
 
 input:
   short_edge_scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
@@ -32,9 +36,11 @@ input:
 dit:
   drop_path: 0.1
   use_checkpoint: true
+  pyramid_channels: 256
 
 dino:
   optimizer: adamw
+  fused_optimizer: true
   adam_betas: [0.9, 0.999]
   scheduler: step
   hidden_dim: 256
@@ -66,6 +72,8 @@ dino:
   use_ema: false
   ema_decay: 0.9997
   ema_epoch: 0
+  ddp_gradient_as_bucket_view: true
+  ddp_static_graph: true
   score_threshold: 0.5
 
 tracking:
