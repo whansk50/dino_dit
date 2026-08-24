@@ -11,6 +11,13 @@ from dit_layout_bench.config import DEFAULT_CONFIG, DETECTORS, RunConfig, load_s
 from dit_layout_bench.tracking import MLflowTracker, process_world_size
 
 
+def _probability(value: str) -> float:
+    number = float(value)
+    if not 0 <= number <= 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return number
+
+
 def _parser(action: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=f"dit-layout-{action}",
@@ -37,7 +44,7 @@ def _parser(action: str) -> argparse.ArgumentParser:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     if action == "inference":
         parser.add_argument("--image", type=Path, required=True)
-        parser.add_argument("--score-threshold", type=float)
+        parser.add_argument("--score-threshold", type=_probability)
         parser.add_argument("--json-output", type=Path)
     return parser
 

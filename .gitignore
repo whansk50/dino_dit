@@ -1,8 +1,7 @@
 publaynet/
-instruction.md
-download_from_huggingface.py
 __pycache__/
 nohup.out
 ./.vscode/
 ./DINO/
 ./dit/
+train.log

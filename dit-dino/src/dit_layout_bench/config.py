@@ -199,6 +199,8 @@ def _validate_settings(settings: Mapping[str, Any]) -> None:
             raise ValueError(f"dino.{key} must be non-negative")
     if not 0 <= dino["focal_alpha"] <= 1:
         raise ValueError("dino.focal_alpha must be between 0 and 1")
+    if not 0 <= dino["score_threshold"] <= 1:
+        raise ValueError("dino.score_threshold must be between 0 and 1")
 
     if settings["dit"]["pyramid_channels"] < 1:
         raise ValueError("dit.pyramid_channels must be positive")
@@ -208,10 +210,21 @@ def _validate_settings(settings: Mapping[str, Any]) -> None:
         raise ValueError(
             "cascade.anchor_sizes must contain one size for each of p2/p3/p4/p5"
         )
+    if any(value < 1 for value in cascade["anchor_sizes"]):
+        raise ValueError("cascade.anchor_sizes values must be positive")
+    if not cascade["aspect_ratios"] or any(
+        not value > 0 for value in cascade["aspect_ratios"]
+    ):
+        raise ValueError("cascade.aspect_ratios must contain positive values")
+    for key in ("roi_batch_size_per_image", "rpn_batch_size_per_image"):
+        if cascade[key] < 1:
+            raise ValueError(f"cascade.{key} must be positive")
     if any(not 0 < step < 1 for step in cascade["lr_steps"]):
         raise ValueError("cascade.lr_steps values must be fractions between 0 and 1")
     if not 0 <= cascade["nms_threshold"] <= 1:
         raise ValueError("cascade.nms_threshold must be between 0 and 1")
+    if not 0 <= cascade["score_threshold"] <= 1:
+        raise ValueError("cascade.score_threshold must be between 0 and 1")
 
     tracking = settings["tracking"]
     if tracking["log_every_steps"] < 1:

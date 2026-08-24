@@ -11,3 +11,4 @@ weights/
 mlruns/
 mlflow.db
 instruction.md
+train.log

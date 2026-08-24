@@ -307,6 +307,10 @@ def main(args):
 
     if args.eval:
         os.environ['EVAL_FLAG'] = 'TRUE'
+        # Expose the checkpoint epoch to the scoped MLflow adapter. Checkpoint
+        # epochs are zero-based while MLflow charts use human-facing epoch numbers.
+        args._tracking_eval_epoch = checkpoint.get('epoch', -1) + 1 if args.resume else 0
+        args._tracking_eval_prefix = 'eval'
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir, wo_class_error=wo_class_error, args=args)
         if args.output_dir:
@@ -367,6 +371,9 @@ def main(args):
         test_stats = {}
         coco_evaluator = None
         if should_evaluate:
+            # The adapter reads this value and records evaluation curves by epoch.
+            args._tracking_eval_epoch = epoch + 1
+            args._tracking_eval_prefix = 'eval'
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
                 wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
@@ -390,6 +397,7 @@ def main(args):
 
         # eval ema
         if args.use_ema and should_evaluate:
+            args._tracking_eval_prefix = 'eval_ema'
             ema_test_stats, ema_coco_evaluator = evaluate(
                 ema_m.module, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
                 wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)

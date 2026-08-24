@@ -15,6 +15,38 @@ from dit_layout_bench.paths import CONFIG_ROOT, DINO_ROOT, require_path
 DINO_CONFIG = CONFIG_ROOT / "dino_publaynet.py"
 DINO_MAIN_MODULE = "_dit_layout_bench_dino_main"
 
+_COCO_BBOX_METRIC_NAMES = (
+    "mAP",
+    "AP50",
+    "AP75",
+    "AP_small",
+    "AP_medium",
+    "AP_large",
+    "AR_1",
+    "AR_10",
+    "AR_100",
+    "AR_small",
+    "AR_medium",
+    "AR_large",
+)
+
+
+def _evaluation_metrics(
+    stats: dict[str, Any], *, prefix: str = "eval"
+) -> dict[str, Any]:
+    """Flatten DINO's COCO bbox summary into MLflow scalar metrics."""
+    metrics = {
+        f"{prefix}/{name}": value
+        for name, value in stats.items()
+        if name != "coco_eval_bbox"
+    }
+    bbox_summary = stats.get("coco_eval_bbox")
+    if bbox_summary is not None:
+        for name, value in zip(_COCO_BBOX_METRIC_NAMES, bbox_summary):
+            # COCOeval reports ratios while per-category AP below is a percentage.
+            metrics[f"{prefix}/bbox_{name}"] = float(value) * 100.0
+    return metrics
+
 
 def _activate_dino() -> None:
     root = str(require_path(DINO_ROOT, "DINO source tree"))
@@ -266,12 +298,20 @@ def _patched_dino_runtime(dino_main, dino_model) -> Iterator[None]:
         result = originals["evaluate"](*args, **kwargs)
         evaluator = result[1]
         tracker = active_tracker()
+        runner_args = kwargs.get("args")
+        epoch = getattr(runner_args, "_tracking_eval_epoch", 0)
+        prefix = getattr(runner_args, "_tracking_eval_prefix", "eval")
         if tracker is not None:
-            tracker.log_metrics({f"eval/{key}": value for key, value in result[0].items()})
+            tracker.log_metrics(
+                _evaluation_metrics(result[0], prefix=prefix), step=epoch
+            )
         if "bbox" in evaluator.coco_eval:
             categories = print_per_category_ap(evaluator.coco_eval["bbox"])
             if tracker is not None:
-                tracker.log_metrics({f"eval/AP_{key}": value for key, value in categories.items()})
+                tracker.log_metrics(
+                    {f"{prefix}/AP_{key}": value for key, value in categories.items()},
+                    step=epoch,
+                )
         return result
 
     def train_step_callback(metrics, step):

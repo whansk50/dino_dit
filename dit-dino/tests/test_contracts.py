@@ -1,7 +1,11 @@
 import argparse
+import json
 import os
 from pathlib import Path
+import sqlite3
+import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -11,12 +15,17 @@ import torch
 from dit_layout_bench.config import RunConfig, load_settings
 from dit_layout_bench.cli import _config, _parser, _validated_config
 from dit_layout_bench.checkpoint import _safe_torch_load
-from dit_layout_bench.backends.dino import _activate_dino, _runner_arguments
+from dit_layout_bench.backends.dino import (
+    _activate_dino,
+    _evaluation_metrics,
+    _patched_dino_runtime,
+    _runner_arguments,
+)
 from dit_layout_bench.data import validate_publaynet
 from dit_layout_bench.optim import parameter_groups
 from dit_layout_bench.prediction import prediction_record
 from dit_layout_bench.spec import category_id_to_train_label, train_label_to_category_id
-from dit_layout_bench.tracking import process_rank, process_world_size
+from dit_layout_bench.tracking import MLflowTracker, process_rank, process_world_size
 
 FIXTURE = Path(__file__).parent / "fixtures" / "publaynet"
 
@@ -48,6 +57,22 @@ class ContractTests(unittest.TestCase):
         summaries = validate_publaynet(FIXTURE)
         self.assertEqual([item.images for item in summaries], [1, 1])
         RunConfig("dino", FIXTURE, FIXTURE / "out", None).validate()
+
+    def test_dataset_category_names_must_match_publaynet_mapping(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "annotations").mkdir()
+            for split in ("train", "val"):
+                (root / split).mkdir()
+                source = FIXTURE / "annotations" / f"{split}.json"
+                document = json.loads(source.read_text(encoding="utf-8"))
+                if split == "train":
+                    document["categories"][0]["name"] = "Figure"
+                (root / "annotations" / f"{split}.json").write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+            with self.assertRaisesRegex(ValueError, "category mapping must be exactly"):
+                validate_publaynet(root)
 
     def test_detector_validation(self):
         with self.assertRaises(ValueError):
@@ -100,6 +125,31 @@ class ContractTests(unittest.TestCase):
     def test_override_type_is_checked(self):
         with self.assertRaisesRegex(ValueError, "training.epochs must be an integer"):
             load_settings(options=["training.epochs=wrong"])
+
+    def test_detector_numeric_ranges_are_validated(self):
+        cases = (
+            ("dino.score_threshold=1.1", "dino.score_threshold"),
+            ("cascade.score_threshold=-0.1", "cascade.score_threshold"),
+            ("cascade.anchor_sizes=[32,64,128,0]", "cascade.anchor_sizes"),
+            ("cascade.aspect_ratios=[0.5,0,2.0]", "cascade.aspect_ratios"),
+            ("cascade.roi_batch_size_per_image=0", "roi_batch_size_per_image"),
+            ("cascade.rpn_batch_size_per_image=0", "rpn_batch_size_per_image"),
+        )
+        for option, message in cases:
+            with self.subTest(option=option):
+                settings = load_settings(options=[option])
+                config = RunConfig(
+                    "dino", FIXTURE, FIXTURE / "out", None, settings=settings
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    config.validate()
+
+    def test_inference_cli_rejects_invalid_score_threshold(self):
+        parser = _parser("inference")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["--image", str(__file__), "--score-threshold", "nan"]
+            )
 
     def test_partial_config_merges_with_defaults(self):
         settings = load_settings(Path(__file__).parent / "fixtures" / "custom.yaml")
@@ -217,6 +267,107 @@ class ContractTests(unittest.TestCase):
         settings = load_settings()
         self.assertIs(settings["tracking"]["enabled"], True)
         self.assertEqual(settings["tracking"]["experiment_name"], "dit-dino-publaynet")
+
+    def test_dino_coco_summary_is_flattened_for_mlflow(self):
+        metrics = _evaluation_metrics(
+            {
+                "loss": 0.25,
+                "coco_eval_bbox": [0.42, 0.61, 0.45, 0.1, 0.4, 0.5],
+            }
+        )
+        self.assertEqual(metrics["eval/loss"], 0.25)
+        self.assertEqual(metrics["eval/bbox_mAP"], 42.0)
+        self.assertEqual(metrics["eval/bbox_AP50"], 61.0)
+        self.assertNotIn("eval/coco_eval_bbox", metrics)
+
+    def test_dino_evaluations_reach_mlflow_with_epoch_steps(self):
+        import mlflow
+
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "tracking.db"
+            tracking_uri = f"sqlite:///{database}"
+            settings = {
+                "tracking": {
+                    "enabled": True,
+                    "tracking_uri": tracking_uri,
+                    "experiment_name": "integration-test",
+                    "run_name": "eval-steps",
+                }
+            }
+            config = SimpleNamespace(
+                tracking=settings["tracking"],
+                settings=settings,
+                detector="dino",
+                batch_size=1,
+            )
+            dino_main = SimpleNamespace(
+                build_dataset=object(),
+                get_param_dict=object(),
+                evaluate=lambda *args, **kwargs: (
+                    {
+                        "loss": (
+                            float(kwargs["args"]._tracking_eval_epoch)
+                            if kwargs["args"]._tracking_eval_prefix == "eval"
+                            else float(kwargs["args"]._tracking_eval_epoch + 10)
+                        ),
+                        "coco_eval_bbox": [0.42, 0.61, 0.45],
+                    },
+                    SimpleNamespace(coco_eval={"bbox": object()}),
+                ),
+            )
+            dino_model = SimpleNamespace(build_backbone=object())
+            fake_engine = SimpleNamespace(TRAIN_STEP_CALLBACK=None)
+            previous_uri = mlflow.get_tracking_uri()
+            try:
+                with patch.dict(sys.modules, {"engine": fake_engine}), patch(
+                    "dit_layout_bench.evaluation.print_per_category_ap",
+                    return_value={"Text": 91.0},
+                ):
+                    with MLflowTracker(config, "train"):
+                        with _patched_dino_runtime(dino_main, dino_model):
+                            for epoch in (1, 2):
+                                dino_main.evaluate(
+                                    args=SimpleNamespace(
+                                        _tracking_eval_epoch=epoch,
+                                        _tracking_eval_prefix="eval",
+                                    )
+                                )
+                                dino_main.evaluate(
+                                    args=SimpleNamespace(
+                                        _tracking_eval_epoch=epoch,
+                                        _tracking_eval_prefix="eval_ema",
+                                    )
+                                )
+            finally:
+                mlflow.set_tracking_uri(previous_uri)
+
+            connection = sqlite3.connect(database)
+            rows = connection.execute(
+                "SELECT key, step, value FROM metrics "
+                "WHERE key IN ("
+                "'eval/loss', 'eval/bbox_mAP', 'eval/AP_Text', "
+                "'eval_ema/loss', 'eval_ema/bbox_mAP', 'eval_ema/AP_Text'"
+                ") "
+                "ORDER BY key, step"
+            ).fetchall()
+            connection.close()
+            self.assertEqual(
+                rows,
+                [
+                    ("eval/AP_Text", 1, 91.0),
+                    ("eval/AP_Text", 2, 91.0),
+                    ("eval/bbox_mAP", 1, 42.0),
+                    ("eval/bbox_mAP", 2, 42.0),
+                    ("eval/loss", 1, 1.0),
+                    ("eval/loss", 2, 2.0),
+                    ("eval_ema/AP_Text", 1, 91.0),
+                    ("eval_ema/AP_Text", 2, 91.0),
+                    ("eval_ema/bbox_mAP", 1, 42.0),
+                    ("eval_ema/bbox_mAP", 2, 42.0),
+                    ("eval_ema/loss", 1, 11.0),
+                    ("eval_ema/loss", 2, 12.0),
+                ],
+            )
 
     def test_tracking_reads_torchrun_topology_before_process_group_init(self):
         environment = {"RANK": "3", "WORLD_SIZE": "8", "LOCAL_RANK": "1"}

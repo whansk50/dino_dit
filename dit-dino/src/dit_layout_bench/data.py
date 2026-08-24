@@ -35,11 +35,15 @@ def validate_publaynet(root: str | Path) -> tuple[DatasetSummary, DatasetSummary
             raise ValueError(f"Invalid JSON in {annotation_path}: {error}") from error
         if not isinstance(document, dict):
             raise ValueError(f"COCO annotation root must be an object: {annotation_path}")
-        categories = {int(item["id"]): item["name"] for item in document.get("categories", [])}
-        if set(categories) != set(PUBLAYNET_CATEGORIES):
+        category_items = document.get("categories", [])
+        categories = {int(item["id"]): item["name"] for item in category_items}
+        if (
+            len(category_items) != len(categories)
+            or categories != PUBLAYNET_CATEGORIES
+        ):
             raise ValueError(
-                f"{annotation_path} category IDs must be {sorted(PUBLAYNET_CATEGORIES)}, "
-                f"got {sorted(categories)}"
+                f"{annotation_path} category mapping must be exactly "
+                f"{PUBLAYNET_CATEGORIES}, got {categories}"
             )
         images = document.get("images", [])
         image_ids = {int(item["id"]) for item in images}

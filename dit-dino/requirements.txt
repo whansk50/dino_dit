@@ -1,0 +1,20 @@
+# Shared model and data runtime
+torch>=2.3
+torchvision>=0.18
+numpy>=1.21
+Pillow>=8
+PyYAML>=6.0
+pycocotools>=2.0.6
+
+# Vendored DINO runtime
+scipy>=1.10
+termcolor>=2
+addict>=2.4
+yapf>=0.40
+timm>=0.9
+
+# Experiment tracking (enabled by default)
+mlflow>=2.10
+
+# Install Detectron2 separately using a build compatible with the selected
+# PyTorch and CUDA versions. Build the vendored DINO ops before using DINO.
