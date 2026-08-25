@@ -12,6 +12,7 @@ from typing import Any
 
 from dit_layout_bench.paths import CONFIG_ROOT, DINO_ROOT, require_path
 from dit_layout_bench.config import RunConfig, per_process_batch_size
+from dit_layout_bench.runtime import activate_device, managed_process_group
 from dit_layout_bench.tracking import process_world_size
 
 
@@ -338,19 +339,14 @@ def _build_dino_integration(config: RunConfig) -> DinoIntegration:
 def train(config: RunConfig) -> None:
     """Run DINO with explicit project integration callbacks."""
     dino_main = _load_dino_main()
+    if process_world_size() == 1:
+        activate_device(config.device)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     config.weights_dir.mkdir(parents=True, exist_ok=True)
     parser = dino_main.get_args_parser()
     args = parser.parse_args(_runner_arguments(config))
-    try:
+    with managed_process_group():
         dino_main.main(args, integration=_build_dino_integration(config))
-    finally:
-        # This runner is imported by the shared CLI rather than executed as a
-        # standalone script, so explicitly release the DDP process group.
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def build_predictor(config: RunConfig, *, score_threshold: float = 0.5):
@@ -363,6 +359,7 @@ def build_predictor(config: RunConfig, *, score_threshold: float = 0.5):
     from util.slconfig import SLConfig
     from dit_layout_bench.prediction import prediction_record
 
+    activate_device(config.device)
     raw = SLConfig.fromfile(str(DINO_CONFIG))
     values = raw._cfg_dict.to_dict()
     values.update(

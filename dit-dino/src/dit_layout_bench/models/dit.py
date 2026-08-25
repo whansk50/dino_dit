@@ -29,6 +29,11 @@ def _drop_path(x: Tensor, probability: float, training: bool) -> Tensor:
     return x.div(keep) * random_tensor
 
 
+def _canonical_gradient_layout(gradient: Tensor) -> Tensor:
+    """Canonicalize singleton strides for DDP gradient bucket views."""
+    return gradient.flatten().clone().view(gradient.shape)
+
+
 class DropPath(nn.Module):
     def __init__(self, probability: float = 0.0) -> None:
         super().__init__()
@@ -143,6 +148,7 @@ class DiTBase(nn.Module):
         self._out_index_set = set(out_indices)
         self.patch_embed = PatchEmbed(image_size, 16, self.embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.cls_token.register_hook(_canonical_gradient_layout)
         self.pos_embed = nn.Parameter(
             torch.zeros(1, self.patch_embed.num_patches + 1, self.embed_dim)
         )

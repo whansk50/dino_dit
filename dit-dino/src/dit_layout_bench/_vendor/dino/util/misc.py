@@ -21,12 +21,21 @@ from torch import Tensor
 
 import colorsys
 
+from dit_layout_bench.runtime import activate_device
+
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
 __torchvision_need_compat_flag = float(torchvision.__version__.split('.')[1]) < 7
 if __torchvision_need_compat_flag:
     from torchvision.ops import _new_empty_tensor
     from torchvision.ops.misc import _output_size
+
+
+def _collective_device():
+    """Return the device required by the active distributed backend."""
+    if is_dist_avail_and_initialized() and dist.get_backend() == 'nccl':
+        return torch.device('cuda', torch.cuda.current_device())
+    return torch.device('cpu')
 
 
 class SmoothedValue(object):
@@ -53,7 +62,11 @@ class SmoothedValue(object):
         """
         if not is_dist_avail_and_initialized():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
+        t = torch.tensor(
+            [self.count, self.total],
+            dtype=torch.float64,
+            device=_collective_device(),
+        )
         dist.barrier()
         dist.all_reduce(t)
         t = t.tolist()
@@ -107,12 +120,12 @@ def all_gather(data):
 
     # serialized to a Tensor
     buffer = pickle.dumps(data)
-    storage = torch.ByteStorage.from_buffer(buffer)
-    tensor = torch.ByteTensor(storage).to("cuda")
+    device = _collective_device()
+    tensor = torch.frombuffer(bytearray(buffer), dtype=torch.uint8).to(device)
 
     # obtain Tensor size of each rank
-    local_size = torch.tensor([tensor.numel()], device="cuda")
-    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    local_size = torch.tensor([tensor.numel()], device=device)
+    size_list = [torch.tensor([0], device=device) for _ in range(world_size)]
     dist.all_gather(size_list, local_size)
     size_list = [int(size.item()) for size in size_list]
     max_size = max(size_list)
@@ -122,9 +135,11 @@ def all_gather(data):
     # gathering tensors of different shapes
     tensor_list = []
     for _ in size_list:
-        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
+        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device=device))
     if local_size != max_size:
-        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+        padding = torch.empty(
+            size=(max_size - local_size,), dtype=torch.uint8, device=device
+        )
         tensor = torch.cat((tensor, padding), dim=0)
     dist.all_gather(tensor_list, tensor)
 
@@ -204,7 +219,7 @@ class MetricLogger(object):
                 for name in names
             ],
             dtype=torch.float64,
-            device="cuda" if dist.get_backend() == "nccl" else "cpu",
+            device=_collective_device(),
         )
         dist.all_reduce(totals)
         for index, name in enumerate(names):
@@ -517,6 +532,7 @@ def init_distributed_mode(args):
         args.world_size = 1
         args.rank = 0
         args.local_rank = 0
+        args.device = str(activate_device(args.device))
         return
 
     if args.world_size < 1 or not 0 <= args.rank < args.world_size:
@@ -528,28 +544,24 @@ def init_distributed_mode(args):
     if args.world_size == 1:
         print('Launcher world size is 1; using single-process mode')
         args.distributed = False
+        if str(args.device).startswith('cuda'):
+            args.device = str(activate_device('cuda:{}'.format(args.local_rank)))
         return
 
     print("world_size:{} rank:{} local_rank:{}".format(args.world_size, args.rank, args.local_rank))
     args.distributed = True
     if str(args.device).startswith('cuda'):
-        if not torch.cuda.is_available():
-            raise RuntimeError('Distributed CUDA training requested, but CUDA is unavailable')
-        if args.local_rank >= torch.cuda.device_count():
-            raise RuntimeError(
-                'LOCAL_RANK={} exceeds visible CUDA device count {}'.format(
-                    args.local_rank, torch.cuda.device_count()
-                )
-            )
-        torch.cuda.set_device(args.local_rank)
-        args.device = 'cuda:{}'.format(args.local_rank)
+        args.device = str(activate_device('cuda:{}'.format(args.local_rank)))
         args.dist_backend = 'nccl'
     else:
         args.dist_backend = 'gloo'
     print('| distributed init (rank {}): {}'.format(args.rank, args.dist_url), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                          world_size=args.world_size, rank=args.rank)
-    torch.distributed.barrier()
+    if args.dist_backend == 'nccl':
+        torch.distributed.barrier(device_ids=[args.gpu])
+    else:
+        torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
 
 

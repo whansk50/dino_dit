@@ -22,7 +22,8 @@ from dit_layout_bench.backends.dino import (
     _evaluation_metrics,
     _runner_arguments,
 )
-from train import _distributed_worker, _parse_devices
+from dit_layout_bench.launcher import LocalLaunch, _run_process, parse_cuda_devices
+from dit_layout_bench.runtime import distributed_session
 from dit_layout_bench.data import validate_publaynet
 from dit_layout_bench.optim import parameter_groups
 from dit_layout_bench.prediction import (
@@ -32,6 +33,13 @@ from dit_layout_bench.prediction import (
 )
 from dit_layout_bench.spec import category_id_to_train_label, train_label_to_category_id
 from dit_layout_bench.tracking import MLflowTracker, process_rank, process_world_size
+from scripts.publaynet_subset import create_publaynet_subset
+from scripts.validate_cascade_training import (
+    _validation_settings as cascade_validation_settings,
+)
+from scripts.validate_dino_training import (
+    _validation_settings as dino_validation_settings,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "publaynet"
 
@@ -115,6 +123,80 @@ class ContractTests(unittest.TestCase):
             annotation.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "category mapping must be exactly"):
                 validate_publaynet(root)
+
+    def test_runtime_validator_creates_symlinked_publaynet_subset(self):
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "subset"
+            _write_publaynet_fixture(source)
+            Image.new("RGB", (64, 64), "white").save(source / "train" / "train.jpg")
+            annotation = source / "annotations" / "train.json"
+            document = json.loads(annotation.read_text(encoding="utf-8"))
+            document["annotations"] = [
+                {
+                    "id": 1,
+                    "image_id": 1,
+                    "category_id": 1,
+                    "bbox": [4, 4, 16, 16],
+                    "area": 256,
+                    "iscrowd": 0,
+                }
+            ]
+            annotation.write_text(json.dumps(document), encoding="utf-8")
+
+            create_publaynet_subset(
+                source, destination, split="train", image_count=1, seed=7
+            )
+            subset_image = destination / "train" / "train.jpg"
+            subset = json.loads(
+                (destination / "annotations" / "train.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(subset_image.is_symlink())
+            self.assertEqual(len(subset["images"]), 1)
+            self.assertEqual(len(subset["annotations"]), 1)
+
+    def test_runtime_validator_enables_production_execution_features(self):
+        args = SimpleNamespace(
+            config=Path(__file__).parents[1] / "configs" / "dino_train.yaml",
+            seed=42,
+            pretrained=Path(__file__),
+            image_size=128,
+            full_detector=False,
+        )
+        with TemporaryDirectory() as directory:
+            settings = dino_validation_settings(
+                args, work_dir=Path(directory), world_size=2, epochs=1
+            )
+        self.assertIs(settings["run"]["amp"], True)
+        self.assertIs(settings["dit"]["use_checkpoint"], True)
+        self.assertIs(settings["dino"]["ddp_static_graph"], True)
+        self.assertIs(settings["dino"]["fused_optimizer"], True)
+        self.assertIs(settings["tracking"]["enabled"], True)
+        self.assertEqual(settings["training"]["batch_size"], 2)
+
+    def test_cascade_runtime_validator_enables_ddp_runtime_features(self):
+        args = SimpleNamespace(
+            config=Path(__file__).parents[1]
+            / "configs"
+            / "cascade_rcnn_train.yaml",
+            seed=42,
+            pretrained=Path(__file__),
+            image_size=128,
+        )
+        with TemporaryDirectory() as directory:
+            settings = cascade_validation_settings(
+                args, work_dir=Path(directory), world_size=2, epochs=1
+            )
+        self.assertIs(settings["run"]["amp"], True)
+        self.assertIs(settings["dit"]["use_checkpoint"], True)
+        self.assertIs(settings["tracking"]["enabled"], True)
+        self.assertEqual(settings["training"]["batch_size"], 2)
+        self.assertEqual(settings["cascade_rcnn"]["roi_batch_size_per_image"], 32)
 
     def test_detector_validation(self):
         with self.assertRaises(ValueError):
@@ -398,6 +480,30 @@ class ContractTests(unittest.TestCase):
         args = parser.parse_args(["--options", "lr_drop_list=[11]"])
         self.assertEqual(args.options["lr_drop_list"], [11])
 
+    def test_dino_denoising_tensors_follow_target_device(self):
+        _activate_dino()
+        from models.dino.dn_components import prepare_for_cdn
+
+        label_encoder = torch.nn.Embedding(6, 8)
+        targets = [
+            {
+                "labels": torch.tensor([1], dtype=torch.long),
+                "boxes": torch.tensor([[0.5, 0.5, 0.25, 0.25]]),
+            }
+        ]
+        query_label, query_box, attention_mask, metadata = prepare_for_cdn(
+            (targets, 2, 0.5, 0.4),
+            training=True,
+            num_queries=10,
+            num_classes=6,
+            hidden_dim=8,
+            label_enc=label_encoder,
+        )
+        self.assertEqual(query_label.device, targets[0]["labels"].device)
+        self.assertEqual(query_box.device, targets[0]["boxes"].device)
+        self.assertEqual(attention_mask.device, targets[0]["boxes"].device)
+        self.assertGreater(metadata["pad_size"], 0)
+
     def test_dino_resume_is_forwarded_only_when_explicit(self):
         settings = load_settings()
         without_resume = RunConfig(
@@ -581,24 +687,60 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(process_world_size(), 1)
 
     def test_internal_ddp_device_list_is_explicit_and_validated(self):
-        self.assertEqual(_parse_devices("2,3"), (2, 3))
+        self.assertEqual(parse_cuda_devices("2,3"), (2, 3))
         for value in ("", "0,0", "0,cuda", "-1"):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                _parse_devices(value)
+                parse_cuda_devices(value)
 
     def test_internal_ddp_worker_maps_rank_to_selected_device(self):
-        import train as train_entry
+        launch = LocalLaunch((2, 3), master_port=1234)
+        environment = {}
 
-        with patch.dict(os.environ, {}, clear=True), patch.object(
-            train_entry, "main"
-        ) as worker_main:
-            _distributed_worker(1, 2, (2, 3), ("--devices", "2,3"), "127.0.0.1", 1234)
-            self.assertEqual(os.environ["RANK"], "1")
-            self.assertEqual(os.environ["WORLD_SIZE"], "2")
-            self.assertEqual(os.environ["LOCAL_RANK"], "3")
-            worker_main.assert_called_once_with(
-                ["--devices", "2,3"], _internal_worker=True
+        def worker():
+            environment.update(
+                {name: os.environ[name] for name in launch.environment(1)}
             )
+
+        with patch.dict(os.environ, {}, clear=True):
+            _run_process(1, launch, worker, ())
+            self.assertNotIn("RANK", os.environ)
+        self.assertEqual(environment["RANK"], "1")
+        self.assertEqual(environment["WORLD_SIZE"], "2")
+        self.assertEqual(environment["LOCAL_WORLD_SIZE"], "2")
+        self.assertEqual(environment["LOCAL_RANK"], "1")
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "2,3")
+
+    def test_internal_ddp_preserves_parent_visibility_mapping(self):
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,7,9"}, clear=True):
+            launch = LocalLaunch.create((1, 2))
+        self.assertEqual(launch.environment(0)["CUDA_VISIBLE_DEVICES"], "7,9")
+
+    def test_distributed_session_initializes_and_releases_owned_group(self):
+        environment = {
+            "RANK": "1",
+            "WORLD_SIZE": "2",
+            "LOCAL_RANK": "1",
+            "LOCAL_WORLD_SIZE": "2",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "dit_layout_bench.runtime.activate_device",
+            return_value=torch.device("cuda:1"),
+        ) as activate, patch.object(
+            torch.distributed, "is_available", return_value=True
+        ), patch.object(
+            torch.distributed, "is_initialized", side_effect=[False, True]
+        ), patch.object(
+            torch.distributed, "init_process_group"
+        ) as initialize, patch.object(
+            torch.distributed, "destroy_process_group"
+        ) as destroy:
+            with distributed_session("cuda") as device:
+                self.assertEqual(device, torch.device("cuda:1"))
+        activate.assert_called_once_with("cuda:1")
+        initialize.assert_called_once_with(
+            backend="nccl", init_method="env://", world_size=2, rank=1
+        )
+        destroy.assert_called_once_with()
 
     def test_global_batch_is_divided_per_gpu(self):
         settings = load_settings(options=["training.batch_size=6"])
@@ -651,12 +793,12 @@ class ContractTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             train_entry, "validated_config", return_value=config
         ), patch.object(
-            train_entry, "_validate_cuda_devices"
+            train_entry, "validate_cuda_devices"
         ), patch.object(train_entry, "_launch_distributed") as launch:
             train_entry.main(["--devices", "0,1"])
         launch.assert_called_once_with((0, 1), ["--devices", "0,1"])
 
-    def test_ddp_rejects_backend_without_distributed_integration(self):
+    def test_cascade_config_accepts_distributed_training(self):
         environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
         parser = parser_for("train")
         args = parser.parse_args(
@@ -670,14 +812,14 @@ class ContractTests(unittest.TestCase):
             ]
         )
         with patch.dict(os.environ, environment, clear=True):
-            with self.assertRaises(SystemExit):
-                validated_config(
-                    parser,
-                    args,
-                    require_data=False,
-                    training=True,
-                    require_pretrained=True,
-                )
+            config = validated_config(
+                parser,
+                args,
+                require_data=False,
+                training=True,
+                require_pretrained=True,
+            )
+        self.assertEqual(config.detector, "cascade_rcnn")
 
 
 if __name__ == "__main__":

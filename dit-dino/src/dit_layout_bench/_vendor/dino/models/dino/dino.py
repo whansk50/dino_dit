@@ -508,14 +508,19 @@ class SetCriterion(nn.Module):
             dn_pos_idx = []
             dn_neg_idx = []
             for i in range(len(targets)):
+                device = targets[i]['labels'].device
                 if len(targets[i]['labels']) > 0:
-                    t = torch.range(0, len(targets[i]['labels']) - 1).long().cuda()
+                    t = torch.arange(len(targets[i]['labels']), device=device)
                     t = t.unsqueeze(0).repeat(scalar, 1)
                     tgt_idx = t.flatten()
-                    output_idx = (torch.tensor(range(scalar)) * single_pad).long().cuda().unsqueeze(1) + t
+                    output_idx = (
+                        torch.arange(scalar, device=device) * single_pad
+                    ).unsqueeze(1) + t
                     output_idx = output_idx.flatten()
                 else:
-                    output_idx = tgt_idx = torch.tensor([]).long().cuda()
+                    output_idx = tgt_idx = torch.empty(
+                        0, dtype=torch.long, device=device
+                    )
 
                 dn_pos_idx.append((output_idx, tgt_idx))
                 dn_neg_idx.append((output_idx + single_pad // 2, tgt_idx))
@@ -531,13 +536,15 @@ class SetCriterion(nn.Module):
             l_dict = {k + f'_dn': v for k, v in l_dict.items()}
             losses.update(l_dict)
         else:
-            l_dict = dict()
-            l_dict['loss_bbox_dn'] = torch.as_tensor(0.).to('cuda')
-            l_dict['loss_giou_dn'] = torch.as_tensor(0.).to('cuda')
-            l_dict['loss_ce_dn'] = torch.as_tensor(0.).to('cuda')
-            l_dict['loss_xy_dn'] = torch.as_tensor(0.).to('cuda')
-            l_dict['loss_hw_dn'] = torch.as_tensor(0.).to('cuda')
-            l_dict['cardinality_error_dn'] = torch.as_tensor(0.).to('cuda')
+            zero = torch.zeros((), device=device)
+            l_dict = {
+                'loss_bbox_dn': zero,
+                'loss_giou_dn': zero,
+                'loss_ce_dn': zero,
+                'loss_xy_dn': zero,
+                'loss_hw_dn': zero,
+                'cardinality_error_dn': zero,
+            }
             losses.update(l_dict)
 
         for loss in self.losses:
@@ -575,13 +582,15 @@ class SetCriterion(nn.Module):
                     l_dict = {k + f'_dn_{idx}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
                 else:
-                    l_dict = dict()
-                    l_dict['loss_bbox_dn']=torch.as_tensor(0.).to('cuda')
-                    l_dict['loss_giou_dn']=torch.as_tensor(0.).to('cuda')
-                    l_dict['loss_ce_dn']=torch.as_tensor(0.).to('cuda')
-                    l_dict['loss_xy_dn'] = torch.as_tensor(0.).to('cuda')
-                    l_dict['loss_hw_dn'] = torch.as_tensor(0.).to('cuda')
-                    l_dict['cardinality_error_dn'] = torch.as_tensor(0.).to('cuda')
+                    zero = torch.zeros((), device=device)
+                    l_dict = {
+                        'loss_bbox_dn': zero,
+                        'loss_giou_dn': zero,
+                        'loss_ce_dn': zero,
+                        'loss_xy_dn': zero,
+                        'loss_hw_dn': zero,
+                        'cardinality_error_dn': zero,
+                    }
                     l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 

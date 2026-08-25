@@ -6,7 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from dit_layout_bench.checkpoint import validate_reduced_pyramid_checkpoint
-from dit_layout_bench.models.dit import Attention
+from dit_layout_bench.models.dit import Attention, _canonical_gradient_layout
 from dit_layout_bench.models.pyramid import DiTFeaturePyramid
 
 
@@ -20,6 +20,11 @@ class TinyBackbone(nn.Module):
 
 
 class OptimizationTests(unittest.TestCase):
+    def test_singleton_gradient_uses_canonical_ddp_bucket_strides(self):
+        gradient = torch.empty_strided((1, 1, 8), (64, 8, 1))
+        canonical = _canonical_gradient_layout(gradient)
+        self.assertEqual(canonical.stride(), (8, 8, 1))
+
     def test_sdpa_attention_matches_materialized_reference_on_cpu(self):
         torch.manual_seed(7)
         module = Attention(dim=32, num_heads=4).eval()

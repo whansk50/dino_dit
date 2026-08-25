@@ -23,6 +23,7 @@ class CascadeAPI:
     ShapeSpec: Any
     BACKBONE_REGISTRY: Any
     Backbone: Any
+    comm: Any
 
 
 def _load_api() -> CascadeAPI:
@@ -35,6 +36,7 @@ def _load_api() -> CascadeAPI:
         from detectron2.evaluation import COCOEvaluator
         from detectron2.layers import ShapeSpec
         from detectron2.modeling import BACKBONE_REGISTRY, Backbone
+        from detectron2.utils import comm
     except ImportError as error:
         raise RuntimeError(
             "Cascade R-CNN requires a PyTorch-compatible Detectron2 installation"
@@ -50,6 +52,7 @@ def _load_api() -> CascadeAPI:
         ShapeSpec=ShapeSpec,
         BACKBONE_REGISTRY=BACKBONE_REGISTRY,
         Backbone=Backbone,
+        comm=comm,
     )
 
 
@@ -176,7 +179,13 @@ def _configure_training(cfg: Any, config: RunConfig) -> None:
     )
 
 
-def _build_cfg(api: CascadeAPI, config: RunConfig, *, for_training: bool):
+def _build_cfg(
+    api: CascadeAPI,
+    config: RunConfig,
+    *,
+    for_training: bool,
+    runtime_device: str | None = None,
+):
     cfg = api.get_cfg()
     _configure_model(cfg, config, api.CfgNode)
     _configure_input(cfg, config)
@@ -187,7 +196,7 @@ def _build_cfg(api: CascadeAPI, config: RunConfig, *, for_training: bool):
         cfg.DATASETS.TEST = ()
     cfg.OUTPUT_DIR = str(config.output_dir)
     cfg.SEED = config.seed
-    cfg.MODEL.DEVICE = config.device
+    cfg.MODEL.DEVICE = runtime_device or config.device
     cfg.freeze()
     return cfg
 
@@ -256,7 +265,7 @@ def _build_trainer(api: CascadeAPI, config: RunConfig):
             should_validate = next_iteration == self.trainer.max_iter or (
                 period > 0 and next_iteration % period == 0
             )
-            if should_validate:
+            if should_validate and api.comm.is_main_process():
                 self.trainer.checkpointer.save(Path(RECENT_CHECKPOINT_NAME).stem)
 
     class Trainer(api.DefaultTrainer):
@@ -302,29 +311,55 @@ def _build_trainer(api: CascadeAPI, config: RunConfig):
     return Trainer
 
 
+def _ensure_detectron2_local_group(api: CascadeAPI, local_world_size: int) -> None:
+    """Create Detectron2's node-local group unless its launcher already did."""
+    try:
+        local_group = api.comm.get_local_process_group()
+    except AssertionError:
+        local_group = None
+    if local_group is None:
+        api.comm.create_local_process_group(local_world_size)
+    api.comm.synchronize()
+
+
 def train(config: RunConfig) -> None:
+    from dit_layout_bench.runtime import distributed_session, local_process_world_size
+    from dit_layout_bench.tracking import process_world_size
+
     api = _load_api()
-    _register_backbone(api)
-    _register_data(api, config.data_root)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    config.weights_dir.mkdir(parents=True, exist_ok=True)
-    if config.resume is not None:
-        _validate_resume_checkpoint(config)
-    cfg = _build_cfg(api, config, for_training=True)
-    Trainer = _build_trainer(api, config)
-    trainer = Trainer(cfg)
-    if config.resume is not None:
-        checkpoint = trainer.checkpointer.load(str(config.resume))
-        trainer.start_iter = int(checkpoint.get("iteration", -1)) + 1
-    trainer.train()
+    with distributed_session(config.device) as device:
+        if process_world_size() > 1:
+            _ensure_detectron2_local_group(api, local_process_world_size())
+        _register_backbone(api)
+        _register_data(api, config.data_root)
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        config.weights_dir.mkdir(parents=True, exist_ok=True)
+        if config.resume is not None:
+            _validate_resume_checkpoint(config)
+        cfg = _build_cfg(
+            api, config, for_training=True, runtime_device=str(device)
+        )
+        Trainer = _build_trainer(api, config)
+        trainer = Trainer(cfg)
+        if config.resume is not None:
+            trainer.checkpointer.load(str(config.resume))
+            # DetectionCheckpointer restores the registered Trainer state,
+            # including its nested optimizer, scheduler hooks, and iteration.
+            trainer.start_iter = trainer.iter + 1
+        trainer.train()
 
 
 def build_predictor(config: RunConfig, *, score_threshold: float = 0.5):
     """Load a Cascade R-CNN checkpoint once and return a prediction callable."""
     api = _load_api()
+    from dit_layout_bench.runtime import activate_device
+
+    device = activate_device(config.device)
     _register_backbone(api)
     _validate_resume_checkpoint(config)
-    cfg = _build_cfg(api, config, for_training=False)
+    cfg = _build_cfg(
+        api, config, for_training=False, runtime_device=str(device)
+    )
     cfg.defrost()
     cfg.MODEL.WEIGHTS = str(config.resume)
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = score_threshold

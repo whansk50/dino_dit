@@ -478,8 +478,11 @@ class TransformerEncoder(nn.Module):
         reference_points_list = []
         for lvl, (H_, W_) in enumerate(spatial_shapes):
 
-            ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
-                                          torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
+            ref_y, ref_x = torch.meshgrid(
+                torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
+                torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device),
+                indexing="ij",
+            )
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W_)
             ref = torch.stack((ref_x, ref_y), -1)
@@ -1064,5 +1067,4 @@ def build_deformable_transformer(args):
         embed_init_tgt=args.embed_init_tgt,
         use_detached_boxes_dec_out=use_detached_boxes_dec_out
     )
-
 

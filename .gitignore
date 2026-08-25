@@ -5,3 +5,4 @@ nohup.out
 ./DINO/
 ./dit/
 train.log
+data/

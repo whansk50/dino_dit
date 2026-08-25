@@ -22,11 +22,21 @@ python train.py --detector dino \
   --weights-dir outputs/dino/weights \
   --pretrained /weights/dit-base-224-p16-500k-62d53a.pth
 
-# DINO on two GPUs; train.py launches one PyTorch DDP process per device.
+# Either backend can run on two GPUs; train.py launches one DDP process per device.
 python train.py --devices 0,1 --config configs/dino_train.yaml
+python train.py --devices 0,1 --config configs/cascade_rcnn_train.yaml
 
-# Cascade R-CNN uses its own config and currently runs on one GPU.
-python train.py --config configs/cascade_rcnn_train.yaml
+# Validate production runtime features with a temporary PubLayNet subset.
+python scripts/validate_dino_training.py \
+  --data-root /data/publaynet \
+  --pretrained /weights/dit-base-224-p16-500k-62d53a.pth \
+  --devices 0,1
+
+# Validate the equivalent Cascade fresh/resume DDP path.
+python scripts/validate_cascade_training.py \
+  --data-root /data/publaynet \
+  --pretrained /weights/dit-base-224-p16-500k-62d53a.pth \
+  --devices 0,1
 ```
 
 백엔드별 기본값은 `resources/dino.yaml`과 `resources/cascade_rcnn.yaml`로

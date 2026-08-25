@@ -15,6 +15,8 @@ dit-dino-layout/
 │   ├── checkpoint.py            # hash/키/shape 검증 및 pos-embed 보간
 │   ├── config.py                # detector 선택, strict YAML merge, RunConfig
 │   ├── settings_validation.py   # 공통 및 detector별 설정 값 검증
+│   ├── launcher.py              # 로컬 rank/GPU 매핑과 process spawn
+│   ├── runtime.py               # CUDA device와 process-group lifecycle
 │   ├── data.py, spec.py         # PubLayNet I/O와 category 단일 정의
 │   ├── tracking.py              # 공통 MLflow run과 metric logger
 │   └── _vendor/dino/            # Apache-2.0 DINO 고정 소스와 LICENSE
@@ -44,8 +46,29 @@ vendored multi-scale deformable attention을 같은 환경에서 빌드한다.
 
 ```bash
 bash scripts/build_dino_ops.sh
-python scripts/smoke_dino_op.py
 ```
+
+운영 학습 코드에 smoke 전용 분기를 추가하지 않고 실제 통합 경로를 확인하려면
+PubLayNet 일부를 symlink로 구성하는 별도 validator를 실행한다. 원본 dataset은
+수정하지 않으며 성공 시 임시 dataset, checkpoint, MLflow DB를 자동 제거한다.
+
+```bash
+python scripts/validate_dino_training.py \
+  --data-root /data/publaynet \
+  --pretrained /weights/dit-base-224-p16-500k-62d53a.pth \
+  --devices 0,1
+
+python scripts/validate_cascade_training.py \
+  --data-root /data/publaynet \
+  --pretrained /weights/dit-base-224-p16-500k-62d53a.pth \
+  --devices 0,1
+```
+
+각 validator는 해당 backend를 두 번 학습한다. 첫 실행에서 FP16 AMP, DiT activation
+checkpointing, DDP와 validation/checkpoint 저장을 확인하고, 두 번째 실행에서 학습
+재개와 rank 0 전용 MLflow 기록을 검증한다. DINO validator는 static-graph DDP와
+fused AdamW도 확인하며 detector 전체 layer까지 실행하려면 `--full-detector`를
+추가한다.
 
 ## 3. PubLayNet 준비
 
@@ -116,6 +139,7 @@ python train.py --config configs/cascade_rcnn_train.yaml
 
 # train.py가 선택한 GPU마다 PyTorch DDP process를 하나씩 실행
 python train.py --devices 0,1 --config configs/dino_train.yaml
+python train.py --devices 0,1 --config configs/cascade_rcnn_train.yaml
 
 # 완료된 마지막 epoch부터 명시적으로 학습 재개
 python train.py --config configs/dino_train.yaml --resume
@@ -142,11 +166,13 @@ python inference.py --config configs/cascade_rcnn_train.yaml --resume \
 `torch.multiprocessing.spawn`으로 process를 만들고, 각 process에서
 `torch.distributed`와 `DistributedDataParallel`을 초기화한다. `--devices`를
 생략하거나 하나만 지정하면 단일 process로 실행한다. ID는 PyTorch에 현재
-보이는 CUDA device 기준이며 기존 `CUDA_VISIBLE_DEVICES`를 덮어쓰지 않는다. DINO의
-`training.batch_size`는 global batch이고 `run.num_workers`는 GPU(process)당
-값이다. 위 설정의 global batch 6을 GPU 두 장에서 실행하면 GPU당 batch는 3이며,
-전체 DataLoader worker 수는 `2 × run.num_workers`가 된다. global batch가
-world size로 나누어떨어지지 않으면 process 생성 전에 실행을 거부한다.
+보이는 CUDA device 기준이다. launcher는 선택된 device만 자식 process에 노출하고
+표준 local rank `0..N-1`로 재매핑하므로 비연속 device 선택도 Detectron2 DDP와
+호환된다. 두 backend 모두 `training.batch_size`는 global batch이고
+`run.num_workers`는 GPU(process)당 값이다. global batch 6을 GPU 두 장에서
+실행하면 GPU당 batch는 3이며, 전체 DataLoader worker 수는
+`2 × run.num_workers`가 된다. global batch가 world size로 나누어떨어지지 않으면
+process 생성 전에 실행을 거부한다.
 checkpoint, config, log 및 MLflow run은 global rank 0만 기록하고, 평가 예측과
 loss 통계는 모든 rank에서 모은다. 같은 pyramid 설정의 DDP checkpoint는 단일
 GPU와 상호 호환된다.

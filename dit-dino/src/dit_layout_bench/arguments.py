@@ -188,8 +188,6 @@ def validated_config(
         if training:
             world_size = process_world_size()
             per_process_batch_size(config.batch_size, world_size)
-            if world_size > 1 and config.detector != "dino":
-                raise ValueError("DDP is currently supported only for --detector dino")
         return config
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))

@@ -62,6 +62,15 @@ class SourceTests(unittest.TestCase):
         self.assertIn("integration=_build_dino_integration(config)", backend)
         self.assertNotIn("importlib", dispatcher)
 
+    def test_cascade_owns_ddp_lifecycle_and_restores_nested_trainer_state(self):
+        backend = (
+            ROOT / "src" / "dit_layout_bench" / "backends" / "cascade_rcnn.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("with distributed_session(config.device) as device:", backend)
+        self.assertIn("api.comm.create_local_process_group", backend)
+        self.assertIn("trainer.start_iter = trainer.iter + 1", backend)
+        self.assertNotIn('checkpoint.get("iteration"', backend)
+
 
 if __name__ == "__main__":
     unittest.main()
