@@ -56,19 +56,20 @@ PubLayNet 일부를 symlink로 구성하는 별도 validator를 실행한다. �
 python scripts/validate_dino_training.py \
   --data-root /data/publaynet \
   --pretrained /weights/dit-base-224-p16-500k-62d53a.pth \
-  --devices 0,1
+  --devices 2
 
 python scripts/validate_cascade_training.py \
   --data-root /data/publaynet \
   --pretrained /weights/dit-base-224-p16-500k-62d53a.pth \
-  --devices 0,1
+  --devices 2
 ```
 
 각 validator는 해당 backend를 두 번 학습한다. 첫 실행에서 FP16 AMP, DiT activation
-checkpointing, DDP와 validation/checkpoint 저장을 확인하고, 두 번째 실행에서 학습
-재개와 rank 0 전용 MLflow 기록을 검증한다. DINO validator는 static-graph DDP와
-fused AdamW도 확인하며 detector 전체 layer까지 실행하려면 `--full-detector`를
-추가한다.
+checkpointing과 validation/checkpoint 저장을 확인하고, 두 번째 실행에서 학습
+재개와 MLflow 기록을 검증한다. `--devices 2`처럼 하나를 지정하면 single GPU,
+`--devices 0,1`처럼 둘 이상을 지정하면 DDP와 rank 0 전용 기록까지 확인한다. DINO
+validator는 fused AdamW를 항상 확인하고 multi-GPU에서는 static-graph DDP도
+확인한다. detector 전체 layer까지 실행하려면 `--full-detector`를 추가한다.
 
 ## 3. PubLayNet 준비
 
@@ -128,6 +129,9 @@ RGB → horizontal flip(train) → short edge 480..800 / long edge ≤1333
 ```bash
 python train.py --devices 2 \
   --config configs/dino_train.yaml
+
+python train.py --devices 2 \
+  --config configs/cascade_rcnn_train.yaml
 ```
 
 ## 7. 학습, 평가, 추론

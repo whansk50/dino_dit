@@ -22,6 +22,7 @@ from dit_layout_bench.backends.dino import (
     _evaluation_metrics,
     _runner_arguments,
 )
+from dit_layout_bench.backends.cascade_rcnn import _solver_steps
 from dit_layout_bench.launcher import LocalLaunch, _run_process, parse_cuda_devices
 from dit_layout_bench.runtime import distributed_session
 from dit_layout_bench.data import validate_publaynet
@@ -34,6 +35,13 @@ from dit_layout_bench.prediction import (
 from dit_layout_bench.spec import category_id_to_train_label, train_label_to_category_id
 from dit_layout_bench.tracking import MLflowTracker, process_rank, process_world_size
 from scripts.publaynet_subset import create_publaynet_subset
+from scripts.validation_runtime import (
+    PROJECT_ROOT,
+    SOURCE_ROOT,
+    execution_mode,
+    expected_distributed_tag,
+    project_environment,
+)
 from scripts.validate_cascade_training import (
     _validation_settings as cascade_validation_settings,
 )
@@ -66,6 +74,32 @@ def _write_publaynet_fixture(root: Path) -> None:
 
 
 class ContractTests(unittest.TestCase):
+    def test_cascade_lr_steps_stay_inside_short_validation_run(self):
+        self.assertEqual(_solver_steps(1, (0.75, 0.9)), ())
+        self.assertEqual(_solver_steps(2, (0.75, 0.9)), (1,))
+        self.assertEqual(_solver_steps(4, (0.75, 0.9)), (3,))
+        self.assertEqual(_solver_steps(8, (0.75, 0.9)), (6, 7))
+        with self.assertRaises(ValueError):
+            _solver_steps(0, (0.75, 0.9))
+
+    def test_validation_subprocess_imports_package_from_source_tree(self):
+        with patch.dict(os.environ, {"PYTHONPATH": "/external/python"}, clear=True):
+            environment = project_environment()
+        self.assertEqual(PROJECT_ROOT, Path(__file__).parents[1])
+        self.assertEqual(SOURCE_ROOT, PROJECT_ROOT / "src")
+        self.assertEqual(
+            environment["PYTHONPATH"],
+            f"{SOURCE_ROOT}{os.pathsep}/external/python",
+        )
+
+    def test_validation_runtime_describes_single_and_distributed_execution(self):
+        self.assertEqual(expected_distributed_tag(1), "false")
+        self.assertEqual(expected_distributed_tag(2), "true")
+        self.assertEqual(execution_mode(1), "single GPU")
+        self.assertEqual(execution_mode(2), "2-process DDP")
+        with self.assertRaises(ValueError):
+            expected_distributed_tag(0)
+
     def test_legacy_checkpoint_metadata_uses_safe_loader(self):
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "legacy.pth"
@@ -179,7 +213,13 @@ class ContractTests(unittest.TestCase):
         self.assertIs(settings["tracking"]["enabled"], True)
         self.assertEqual(settings["training"]["batch_size"], 2)
 
-    def test_cascade_runtime_validator_enables_ddp_runtime_features(self):
+        with TemporaryDirectory() as directory:
+            single_settings = dino_validation_settings(
+                args, work_dir=Path(directory), world_size=1, epochs=1
+            )
+        self.assertEqual(single_settings["training"]["batch_size"], 1)
+
+    def test_cascade_runtime_validator_enables_production_execution_features(self):
         args = SimpleNamespace(
             config=Path(__file__).parents[1]
             / "configs"
@@ -197,6 +237,65 @@ class ContractTests(unittest.TestCase):
         self.assertIs(settings["tracking"]["enabled"], True)
         self.assertEqual(settings["training"]["batch_size"], 2)
         self.assertEqual(settings["cascade_rcnn"]["roi_batch_size_per_image"], 32)
+
+        with TemporaryDirectory() as directory:
+            single_settings = cascade_validation_settings(
+                args, work_dir=Path(directory), world_size=1, epochs=1
+            )
+        self.assertEqual(single_settings["training"]["batch_size"], 1)
+
+    def test_runtime_validators_accept_one_selected_device(self):
+        import scripts.validate_cascade_training as cascade_validator
+        import scripts.validate_dino_training as dino_validator
+
+        validators = (
+            (dino_validator, "dino_train.yaml"),
+            (cascade_validator, "cascade_rcnn_train.yaml"),
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for validator, config_name in validators:
+                with self.subTest(validator=validator.__name__):
+                    work_dir = root / config_name
+                    argv = [
+                        "--data-root",
+                        str(FIXTURE),
+                        "--pretrained",
+                        str(Path(__file__)),
+                        "--config",
+                        str(Path(__file__).parents[1] / "configs" / config_name),
+                        "--devices",
+                        "2",
+                        "--train-images",
+                        "2",
+                        "--val-images",
+                        "1",
+                        "--image-size",
+                        "32",
+                        "--work-dir",
+                        str(work_dir),
+                    ]
+                    with patch.dict(
+                        "sys.modules", {"detectron2": Mock()}
+                    ), patch.object(
+                        validator, "validate_cuda_devices"
+                    ) as validate_devices, patch.object(
+                        validator, "create_publaynet_subset"
+                    ), patch.object(
+                        validator, "_run_training"
+                    ) as run_training, patch.object(
+                        validator, "_verify_checkpoint"
+                    ), patch.object(
+                        validator, "_verify_mlflow"
+                    ):
+                        validator.main(argv)
+
+                    validate_devices.assert_called_once_with((2,))
+                    self.assertEqual(run_training.call_count, 2)
+                    self.assertEqual(
+                        [item.args[1] for item in run_training.call_args_list],
+                        [(2,), (2,)],
+                    )
 
     def test_detector_validation(self):
         with self.assertRaises(ValueError):
@@ -797,6 +896,37 @@ class ContractTests(unittest.TestCase):
         ), patch.object(train_entry, "_launch_distributed") as launch:
             train_entry.main(["--devices", "0,1"])
         launch.assert_called_once_with((0, 1), ["--devices", "0,1"])
+
+    def test_train_entrypoint_uses_one_selected_device_without_ddp(self):
+        import train as train_entry
+
+        for detector in ("dino", "cascade_rcnn"):
+            with self.subTest(detector=detector):
+                config = SimpleNamespace(
+                    detector=detector, device="cuda:2", batch_size=1
+                )
+                backend = Mock()
+
+                def capture_config(_parser, args, **_kwargs):
+                    self.assertEqual(args.device, "cuda:2")
+                    return config
+
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                    train_entry, "validated_config", side_effect=capture_config
+                ), patch.object(
+                    train_entry, "validate_cuda_devices"
+                ) as validate_devices, patch.object(
+                    train_entry, "_launch_distributed"
+                ) as launch, patch.object(
+                    train_entry, "MLflowTracker"
+                ), patch.object(
+                    train_entry, "get_backend", return_value=backend
+                ):
+                    train_entry.main(["--devices", "2"])
+
+                validate_devices.assert_called_once_with((2,))
+                launch.assert_not_called()
+                backend.train.assert_called_once_with(config)
 
     def test_cascade_config_accepts_distributed_training(self):
         environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}

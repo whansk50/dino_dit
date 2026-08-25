@@ -1,4 +1,4 @@
-"""Validate Cascade R-CNN DDP on a temporary PubLayNet subset."""
+"""Validate Cascade R-CNN training on a temporary PubLayNet subset."""
 
 from __future__ import annotations
 
@@ -12,6 +12,21 @@ from typing import Any, Mapping
 
 import yaml
 
+if __package__:
+    from .validation_runtime import (
+        PROJECT_ROOT,
+        execution_mode,
+        expected_distributed_tag,
+        project_environment,
+    )
+else:
+    from validation_runtime import (
+        PROJECT_ROOT,
+        execution_mode,
+        expected_distributed_tag,
+        project_environment,
+    )
+
 from dit_layout_bench.checkpoint import safe_torch_load
 from dit_layout_bench.config import load_settings
 from dit_layout_bench.launcher import parse_cuda_devices, validate_cuda_devices
@@ -22,8 +37,6 @@ if __package__:
 else:
     from publaynet_subset import create_publaynet_subset, prepare_empty_work_dir
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_NAME = "cascade-runtime-validation"
 
 
@@ -31,7 +44,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--pretrained", type=Path, required=True)
-    parser.add_argument("--devices", required=True)
+    parser.add_argument(
+        "--devices",
+        required=True,
+        help="one or more comma-separated CUDA device IDs (for example: 2 or 0,1)",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -114,7 +131,12 @@ def _run_training(config: Path, devices: tuple[int, ...], *, resume: bool) -> No
     ]
     if resume:
         command.append("--resume")
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=project_environment(),
+        check=True,
+    )
 
 
 def _nested_mapping(value: object, key: str) -> Mapping[str, Any]:
@@ -150,12 +172,16 @@ def _verify_mlflow(work_dir: Path, *, world_size: int) -> None:
         raise RuntimeError(
             f"Expected exactly two rank-zero MLflow runs, found {len(runs)}"
         )
+    expected_tag = expected_distributed_tag(world_size)
     for run in runs:
         if run.info.status != "FINISHED":
             raise RuntimeError(f"MLflow run did not finish: {run.info.run_id}")
-        if run.data.tags.get("distributed") != "true":
+        actual_tag = run.data.tags.get("distributed")
+        if actual_tag != expected_tag:
             raise RuntimeError(
-                f"MLflow run is not tagged distributed: {run.info.run_id}"
+                "MLflow distributed tag is incorrect: "
+                f"expected={expected_tag}, actual={actual_tag}, "
+                f"run={run.info.run_id}"
             )
         if run.data.params.get("runtime.world_size") != str(world_size):
             raise RuntimeError(f"MLflow world size is incorrect: {run.info.run_id}")
@@ -167,8 +193,6 @@ def main(argv: list[str] | None = None) -> None:
     try:
         devices = parse_cuda_devices(args.devices)
         validate_cuda_devices(devices)
-        if len(devices) < 2:
-            raise ValueError("runtime validation requires at least two CUDA devices")
         if args.image_size < 32 or args.image_size % 32:
             raise ValueError("--image-size must be a multiple of 32 and at least 32")
         if args.train_images < len(devices) * 2:
@@ -238,8 +262,9 @@ def main(argv: list[str] | None = None) -> None:
         _verify_mlflow(work_dir, world_size=len(devices))
         succeeded = True
         print(
-            "Cascade runtime validation OK: AMP, activation checkpointing, "
-            "DDP, optimizer/scheduler state, resume, and rank-zero MLflow"
+            "Cascade runtime validation OK "
+            f"({execution_mode(len(devices))}): AMP, activation checkpointing, "
+            "optimizer/scheduler state, resume, and rank-zero MLflow"
         )
     finally:
         if temporary and succeeded and not args.keep_work_dir:

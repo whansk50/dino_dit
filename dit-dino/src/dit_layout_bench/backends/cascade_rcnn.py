@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import json
 import math
 from dataclasses import dataclass
@@ -154,6 +155,25 @@ def _configure_input(cfg: Any, config: RunConfig) -> None:
     cfg.INPUT.RANDOM_FLIP = input_settings["random_flip"]
 
 
+def _solver_steps(
+    max_iterations: int, fractions: Iterable[float]
+) -> tuple[int, ...]:
+    """Convert fractional LR steps to valid, unique Detectron2 milestones."""
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be positive")
+    if max_iterations == 1:
+        return ()
+    last_valid_step = max_iterations - 1
+    return tuple(
+        sorted(
+            {
+                min(last_valid_step, max(1, round(max_iterations * fraction)))
+                for fraction in fractions
+            }
+        )
+    )
+
+
 def _configure_training(cfg: Any, config: RunConfig) -> None:
     training = config.training
     cascade = config.detector_settings
@@ -165,9 +185,8 @@ def _configure_training(cfg: Any, config: RunConfig) -> None:
     cfg.SOLVER.BASE_LR = training["detector_lr"]
     cfg.SOLVER.WEIGHT_DECAY = training["weight_decay"]
     cfg.SOLVER.MAX_ITER = iterations_per_epoch * config.epochs
-    cfg.SOLVER.STEPS = tuple(
-        max(1, round(cfg.SOLVER.MAX_ITER * fraction))
-        for fraction in cascade["lr_steps"]
+    cfg.SOLVER.STEPS = _solver_steps(
+        cfg.SOLVER.MAX_ITER, cascade["lr_steps"]
     )
     cfg.SOLVER.WARMUP_ITERS = min(
         training["warmup_iters"], max(0, iterations_per_epoch - 1)

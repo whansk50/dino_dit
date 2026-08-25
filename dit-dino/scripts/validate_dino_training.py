@@ -11,6 +11,21 @@ from typing import Any
 
 import yaml
 
+if __package__:
+    from .validation_runtime import (
+        PROJECT_ROOT,
+        execution_mode,
+        expected_distributed_tag,
+        project_environment,
+    )
+else:
+    from validation_runtime import (
+        PROJECT_ROOT,
+        execution_mode,
+        expected_distributed_tag,
+        project_environment,
+    )
+
 from dit_layout_bench.checkpoint import safe_torch_load
 from dit_layout_bench.config import load_settings
 from dit_layout_bench.launcher import parse_cuda_devices, validate_cuda_devices
@@ -22,14 +37,15 @@ else:
     from publaynet_subset import create_publaynet_subset, prepare_empty_work_dir
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--pretrained", type=Path, required=True)
-    parser.add_argument("--devices", required=True)
+    parser.add_argument(
+        "--devices",
+        required=True,
+        help="one or more comma-separated CUDA device IDs (for example: 2 or 0,1)",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -131,7 +147,12 @@ def _run_training(config: Path, devices: tuple[int, ...], *, resume: bool) -> No
     ]
     if resume:
         command.append("--resume")
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=project_environment(),
+        check=True,
+    )
 
 
 def _verify_checkpoint(path: Path, *, expected_epoch: int) -> None:
@@ -161,12 +182,16 @@ def _verify_mlflow(work_dir: Path, *, world_size: int) -> None:
         raise RuntimeError(
             f"Expected exactly two rank-zero MLflow runs, found {len(runs)}"
         )
+    expected_tag = expected_distributed_tag(world_size)
     for run in runs:
         if run.info.status != "FINISHED":
             raise RuntimeError(f"MLflow run did not finish: {run.info.run_id}")
-        if run.data.tags.get("distributed") != "true":
+        actual_tag = run.data.tags.get("distributed")
+        if actual_tag != expected_tag:
             raise RuntimeError(
-                f"MLflow run is not tagged distributed: {run.info.run_id}"
+                "MLflow distributed tag is incorrect: "
+                f"expected={expected_tag}, actual={actual_tag}, "
+                f"run={run.info.run_id}"
             )
         if run.data.params.get("runtime.world_size") != str(world_size):
             raise RuntimeError(f"MLflow world size is incorrect: {run.info.run_id}")
@@ -178,8 +203,6 @@ def main(argv: list[str] | None = None) -> None:
     try:
         devices = parse_cuda_devices(args.devices)
         validate_cuda_devices(devices)
-        if len(devices) < 2:
-            raise ValueError("runtime validation requires at least two CUDA devices")
         if args.image_size < 32 or args.image_size % 32:
             raise ValueError("--image-size must be a multiple of 32 and at least 32")
         if args.train_images < len(devices) * 2:
@@ -236,9 +259,13 @@ def main(argv: list[str] | None = None) -> None:
         _verify_checkpoint(checkpoint, expected_epoch=1)
         _verify_mlflow(work_dir, world_size=len(devices))
         succeeded = True
+        features = ["AMP", "activation checkpointing"]
+        if len(devices) > 1:
+            features.append("static-graph DDP")
+        features.extend(("fused optimizer", "resume", "rank-zero MLflow"))
         print(
-            "DINO runtime validation OK: AMP, activation checkpointing, "
-            "static-graph DDP, fused optimizer, resume, and rank-zero MLflow"
+            f"DINO runtime validation OK ({execution_mode(len(devices))}): "
+            f"{', '.join(features)}"
         )
     finally:
         if temporary and succeeded and not args.keep_work_dir:

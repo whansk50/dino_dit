@@ -64,8 +64,8 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--devices",
         help=(
-            "comma-separated CUDA IDs visible to PyTorch; multiple IDs "
-            "launch DDP internally"
+            "comma-separated CUDA IDs visible to PyTorch; one ID selects a "
+            "single GPU and multiple IDs launch DDP internally"
         ),
     )
 
