@@ -490,16 +490,16 @@ def save_on_master(*args, **kwargs):
 
 
 def init_distributed_mode(args):
-    torchrun_keys = ('RANK', 'WORLD_SIZE', 'LOCAL_RANK')
-    present_torchrun_keys = [key for key in torchrun_keys if os.environ.get(key)]
-    if present_torchrun_keys:
-        missing = [key for key in torchrun_keys if not os.environ.get(key)]
+    launcher_keys = ('RANK', 'WORLD_SIZE', 'LOCAL_RANK')
+    present_launcher_keys = [key for key in launcher_keys if os.environ.get(key)]
+    if present_launcher_keys:
+        missing = [key for key in launcher_keys if not os.environ.get(key)]
         if missing:
             raise RuntimeError(
-                'Incomplete torchrun environment; missing {}'.format(', '.join(missing))
+                'Incomplete distributed environment; missing {}'.format(', '.join(missing))
             )
-        # torchrun already provides global rank/world size. Multiplying these
-        # values by parser defaults causes invalid ranks and initialization hangs.
+        # The launcher already provides global rank/world size. Multiplying
+        # these by parser defaults causes invalid ranks and initialization hangs.
         args.rank = int(os.environ['RANK'])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = args.local_rank = int(os.environ['LOCAL_RANK'])

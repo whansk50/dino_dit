@@ -27,11 +27,6 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
-[project.scripts]
-dit-layout-train = "dit_layout_bench.cli:train_entrypoint"
-dit-layout-evaluate = "dit_layout_bench.cli:evaluate_entrypoint"
-dit-layout-inference = "dit_layout_bench.cli:inference_entrypoint"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = true

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import sys
-from contextlib import contextmanager
+from collections.abc import Callable
+from dataclasses import dataclass
 from importlib import util as importlib_util
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 from dit_layout_bench.paths import CONFIG_ROOT, DINO_ROOT, require_path
+from dit_layout_bench.config import RunConfig, per_process_batch_size
+from dit_layout_bench.tracking import process_world_size
 
 
 DINO_CONFIG = CONFIG_ROOT / "dino_publaynet.py"
@@ -163,13 +166,19 @@ def _build_publaynet(image_set, args):
     return CocoDetection(image_dir, annotation, transforms=pipeline, return_masks=False)
 
 
-def _effective_dino_values(config) -> dict[str, Any]:
+def _effective_dino_values(
+    config: RunConfig, *, for_training: bool = True
+) -> dict[str, Any]:
     """Translate the common YAML schema to DINO's SLConfig names."""
     input_settings = config.input
     training = config.training
     detector = config.detector_settings
     return {
-        "batch_size": config.batch_size,
+        "batch_size": (
+            per_process_batch_size(config.batch_size, process_world_size())
+            if for_training
+            else config.batch_size
+        ),
         "epochs": config.epochs,
         "lr": training["detector_lr"],
         "lr_backbone": training["backbone_lr"],
@@ -177,7 +186,9 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "warmup_iters": training["warmup_iters"],
         "warmup_factor": training["warmup_factor"],
         "evaluate_every_epochs": training["evaluate_every_epochs"],
-        "dit_pretrained": str(config.pretrained) if config.pretrained else None,
+        "dit_pretrained": (
+            str(config.pretrained) if config.pretrained and not config.resume else None
+        ),
         "dit_drop_path": config.dit["drop_path"],
         "dit_use_checkpoint": config.dit["use_checkpoint"],
         "dit_pyramid_channels": config.dit["pyramid_channels"],
@@ -219,7 +230,7 @@ def _effective_dino_values(config) -> dict[str, Any]:
         "use_ema": detector["use_ema"],
         "ema_decay": detector["ema_decay"],
         "ema_epoch": detector["ema_epoch"],
-        "save_checkpoint_interval": training["checkpoint_every_epochs"],
+        "weights_dir": str(config.weights_dir),
         "data_pin_memory": training["pin_memory"],
         "data_non_blocking": training["non_blocking"],
         "data_persistent_workers": training["persistent_workers"],
@@ -242,7 +253,7 @@ def _option(name: str, value: Any) -> str:
     return f"{name}={serialized}"
 
 
-def _runner_arguments(config, *, evaluate: bool) -> list[str]:
+def _runner_arguments(config: RunConfig) -> list[str]:
     arguments = [
         "--config_file",
         str(DINO_CONFIG),
@@ -263,8 +274,6 @@ def _runner_arguments(config, *, evaluate: bool) -> list[str]:
         arguments.append("--amp")
     if config.resume:
         arguments.extend(("--resume", str(config.resume)))
-    if evaluate:
-        arguments.append("--eval")
     arguments.append("--options")
     arguments.extend(
         _option(name, value)
@@ -273,37 +282,34 @@ def _runner_arguments(config, *, evaluate: bool) -> list[str]:
     return arguments
 
 
-@contextmanager
-def _patched_dino_runtime(dino_main, dino_model) -> Iterator[None]:
-    """Install DINO integration hooks and restore upstream globals afterwards."""
+@dataclass(frozen=True)
+class DinoIntegration:
+    """Explicit project callbacks consumed by the vendored DINO runner."""
+
+    build_backbone: Callable[..., Any]
+    build_dataset: Callable[..., Any]
+    build_parameter_groups: Callable[..., Any]
+    on_evaluation: Callable[..., Any]
+    on_train_step: Callable[..., Any]
+
+
+def _build_dino_integration(config: RunConfig) -> DinoIntegration:
     from dit_layout_bench.evaluation import print_per_category_ap
     from dit_layout_bench.optim import parameter_groups
     from dit_layout_bench.tracking import active_tracker
-    import engine as dino_engine
-
-    originals = {
-        "build_backbone": dino_model.build_backbone,
-        "build_dataset": dino_main.build_dataset,
-        "get_param_dict": dino_main.get_param_dict,
-        "evaluate": dino_main.evaluate,
-        "train_step_callback": dino_engine.TRAIN_STEP_CALLBACK,
-    }
 
     def optimizer_groups(args, model):
         return parameter_groups(
             model, detector_lr=args.lr, backbone_lr=args.lr_backbone
         )
 
-    def evaluate_with_classes(*args, **kwargs):
-        result = originals["evaluate"](*args, **kwargs)
-        evaluator = result[1]
+    def evaluation_callback(stats, evaluator, runner_args):
         tracker = active_tracker()
-        runner_args = kwargs.get("args")
         epoch = getattr(runner_args, "_tracking_eval_epoch", 0)
         prefix = getattr(runner_args, "_tracking_eval_prefix", "eval")
         if tracker is not None:
             tracker.log_metrics(
-                _evaluation_metrics(result[0], prefix=prefix), step=epoch
+                _evaluation_metrics(stats, prefix=prefix), step=epoch
             )
         if "bbox" in evaluator.coco_eval:
             categories = print_per_category_ap(evaluator.coco_eval["bbox"])
@@ -312,119 +318,106 @@ def _patched_dino_runtime(dino_main, dino_model) -> Iterator[None]:
                     {f"{prefix}/AP_{key}": value for key, value in categories.items()},
                     step=epoch,
                 )
-        return result
 
     def train_step_callback(metrics, step):
         tracker = active_tracker()
-        if tracker is None or step % config_tracking_interval() != 0:
+        interval = int(config.tracking["log_every_steps"])
+        if tracker is None or step % interval != 0:
             return
         tracker.log_metrics({f"train/{key}": value for key, value in metrics.items()}, step)
 
-    def config_tracking_interval():
-        tracker = active_tracker()
-        return int(tracker.config.tracking["log_every_steps"]) if tracker else 1
-
-    dino_model.build_backbone = build_dino_backbone
-    dino_main.build_dataset = _build_publaynet
-    dino_main.get_param_dict = optimizer_groups
-    dino_main.evaluate = evaluate_with_classes
-    dino_engine.TRAIN_STEP_CALLBACK = train_step_callback
-    try:
-        yield
-    finally:
-        dino_model.build_backbone = originals["build_backbone"]
-        dino_main.build_dataset = originals["build_dataset"]
-        dino_main.get_param_dict = originals["get_param_dict"]
-        dino_main.evaluate = originals["evaluate"]
-        dino_engine.TRAIN_STEP_CALLBACK = originals["train_step_callback"]
+    return DinoIntegration(
+        build_backbone=build_dino_backbone,
+        build_dataset=_build_publaynet,
+        build_parameter_groups=optimizer_groups,
+        on_evaluation=evaluation_callback,
+        on_train_step=train_step_callback,
+    )
 
 
-def run(config, *, evaluate: bool = False) -> None:
-    """Run official DINO training/evaluation after installing scoped adapters."""
-    _activate_dino()
+def train(config: RunConfig) -> None:
+    """Run DINO with explicit project integration callbacks."""
     dino_main = _load_dino_main()
-    import models.dino.dino as dino_model
-
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    config.weights_dir.mkdir(parents=True, exist_ok=True)
     parser = dino_main.get_args_parser()
-    args = parser.parse_args(_runner_arguments(config, evaluate=evaluate))
+    args = parser.parse_args(_runner_arguments(config))
     try:
-        with _patched_dino_runtime(dino_main, dino_model):
-            dino_main.main(args)
+        dino_main.main(args, integration=_build_dino_integration(config))
     finally:
         # This runner is imported by the shared CLI rather than executed as a
-        # standalone script, so explicitly release torchrun's process group.
+        # standalone script, so explicitly release the DDP process group.
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
 
 
-def train(config) -> None:
-    run(config, evaluate=False)
-
-
-def evaluate(config) -> None:
-    if config.resume is None:
-        raise ValueError("DINO evaluation requires --resume")
-    run(config, evaluate=True)
-
-
-def predict(config, image_path: Path, *, score_threshold: float = 0.5):
+def build_predictor(config: RunConfig, *, score_threshold: float = 0.5):
+    """Load a DINO checkpoint once and return an image prediction callable."""
     _activate_dino()
     import torch
     import torchvision.transforms.functional as vision
     from PIL import Image
     from util.misc import nested_tensor_from_tensor_list
     from util.slconfig import SLConfig
-    import models.dino.dino as dino_model
     from dit_layout_bench.prediction import prediction_record
 
     raw = SLConfig.fromfile(str(DINO_CONFIG))
     values = raw._cfg_dict.to_dict()
-    values.update(_effective_dino_values(config), device=config.device)
+    values.update(
+        _effective_dino_values(config, for_training=False), device=config.device
+    )
     args = SimpleNamespace(**values)
     dino_main = _load_dino_main()
-    original_backbone = dino_model.build_backbone
-    dino_model.build_backbone = build_dino_backbone
-    try:
-        model, _, postprocessors = dino_main.build_model_main(args)
-    finally:
-        dino_model.build_backbone = original_backbone
-    from dit_layout_bench.checkpoint import (
-        safe_torch_load,
-        validate_reduced_pyramid_checkpoint,
+    model, _, postprocessors = dino_main.build_model_main(
+        args, backbone_builder=build_dino_backbone
     )
+    from dit_layout_bench.checkpoint import load_detector_checkpoint
 
-    checkpoint = safe_torch_load(config.resume)
-    validate_reduced_pyramid_checkpoint(
-        checkpoint, expected_channels=config.dit["pyramid_channels"]
+    checkpoint = load_detector_checkpoint(
+        config.resume,
+        expected_pyramid_channels=config.dit["pyramid_channels"],
     )
     model.load_state_dict(checkpoint.get("model", checkpoint), strict=True)
     model.to(config.device).eval()
 
-    image = Image.open(image_path).convert("RGB")
-    original_width, original_height = image.size
-    scale = min(
-        max(config.input["short_edge_scales"]) / min(image.size),
-        config.input["max_long_edge"] / max(image.size),
-    )
-    resized = vision.resize(image, [round(original_height * scale), round(original_width * scale)])
-    tensor = vision.to_tensor(resized)
-    tensor = vision.normalize(
-        tensor, list(config.input["mean"]), list(config.input["std"])
-    )
-    samples = nested_tensor_from_tensor_list([tensor]).to(config.device)
-    with torch.no_grad():
-        outputs = model(samples)
-        target_sizes = torch.tensor([[original_height, original_width]], device=config.device)
-        result = postprocessors["bbox"](outputs, target_sizes)[0]
-    keep = result["scores"] >= score_threshold
-    records = []
-    for box, score, label in zip(
-        result["boxes"][keep].cpu(), result["scores"][keep].cpu(), result["labels"][keep].cpu()
-    ):
-        category_id = int(label)
-        if 1 <= category_id <= 5:
-            records.append(prediction_record(image_path.stem, box, score, category_id))
-    return records
+    def predict_image(image_path: Path):
+        image_path = Path(image_path)
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+        original_width, original_height = image.size
+        scale = min(
+            max(config.input["short_edge_scales"]) / min(image.size),
+            config.input["max_long_edge"] / max(image.size),
+        )
+        resized = vision.resize(
+            image,
+            [round(original_height * scale), round(original_width * scale)],
+        )
+        tensor = vision.to_tensor(resized)
+        tensor = vision.normalize(
+            tensor, list(config.input["mean"]), list(config.input["std"])
+        )
+        samples = nested_tensor_from_tensor_list([tensor]).to(config.device)
+        with torch.inference_mode():
+            outputs = model(samples)
+            target_sizes = torch.tensor(
+                [[original_height, original_width]], device=config.device
+            )
+            result = postprocessors["bbox"](outputs, target_sizes)[0]
+        keep = result["scores"] >= score_threshold
+        records = []
+        for box, score, label in zip(
+            result["boxes"][keep].cpu(),
+            result["scores"][keep].cpu(),
+            result["labels"][keep].cpu(),
+        ):
+            category_id = int(label)
+            if 1 <= category_id <= 5:
+                records.append(
+                    prediction_record(image_path.stem, box, score, category_id)
+                )
+        return records
+
+    return predict_image

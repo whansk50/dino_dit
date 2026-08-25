@@ -6,20 +6,19 @@ run:
   amp: true
 
 paths:
-  data_root: ../publaynet
+  data_root: ./publaynet
   output_dir: outputs/dino-fpn256
-  pretrained: /workspace/boin-dit/boinDiT/pretrained_model/dit-base-224-p16-500k-62d53a.pth
-  resume: ""
+  weights_dir: outputs/dino-fpn256/weights
+  pretrained: ./dit-base-224-p16-500k-62d53a.pth
 
 training:
-  batch_size: 3
+  batch_size: 6  # global; two GPUs use three images each
   epochs: 12
   detector_lr: 1.0e-4
   backbone_lr: 1.0e-5
   weight_decay: 0.05
   warmup_iters: 1000
   warmup_factor: 0.001
-  checkpoint_every_epochs: 1
   evaluate_every_epochs: 1
   pin_memory: true
   non_blocking: true

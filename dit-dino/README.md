@@ -19,18 +19,20 @@ bash scripts/build_dino_ops.sh
 
 python train.py --detector dino \
   --data-root /data/publaynet \
+  --weights-dir outputs/dino/weights \
   --pretrained /weights/dit-base-224-p16-500k-62d53a.pth
 
-# DINO on every visible GPU (one process per GPU, NUMA-local CPU binding)
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=gpu \
-  --numa-binding=node \
-  train.py --config configs/dino_train.yaml
+# DINO on two GPUs; train.py launches one PyTorch DDP process per device.
+python train.py --devices 0,1 --config configs/dino_train.yaml
+
+# Cascade R-CNN uses its own config and currently runs on one GPU.
+python train.py --config configs/cascade_rcnn_train.yaml
 ```
 
-모든 사용자 하이퍼파라미터는 버전 관리되는 `src/dit_layout_bench/resources/default.yaml`에 있다.
-`--config`로 partial YAML을 병합하고 `--options section.key=value`로 한 번 더
-덮어쓸 수 있다. 학습·평가·추론은 기본적으로 MLflow에 effective config와
-metric을 기록한다.
+백엔드별 기본값은 `resources/dino.yaml`과 `resources/cascade_rcnn.yaml`로
+분리되어 있다. `--config`로 같은 detector의 partial YAML을 병합하고
+`--options section.key=value`로 한 번 더 덮어쓸 수 있다. 학습·평가·추론은
+기본적으로 MLflow에 effective config와 metric을 기록한다.
 
 AMP는 현재 FP16만 사용한다. DiT attention은 CUDA FP16에서 PyTorch Flash
 SDPA backend를 강제하며, BF16은 vendored deformable-attention CUDA op 검증 전까지

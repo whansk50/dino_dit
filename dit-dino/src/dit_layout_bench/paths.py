@@ -9,6 +9,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parents[1]
 CONFIG_ROOT = PACKAGE_ROOT / "resources"
 DINO_ROOT = PACKAGE_ROOT / "_vendor" / "dino"
+RECENT_CHECKPOINT_NAME = "recent.pth"
 
 
 def require_path(path: Path, description: str) -> Path:

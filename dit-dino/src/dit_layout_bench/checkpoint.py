@@ -58,10 +58,6 @@ def safe_torch_load(path: str | Path) -> object:
         return torch.load(Path(path), map_location="cpu", weights_only=True)
 
 
-# Kept for compatibility with existing callers and tests.
-_safe_torch_load = safe_torch_load
-
-
 def validate_reduced_pyramid_checkpoint(
     checkpoint: object, *, expected_channels: int
 ) -> None:
@@ -96,6 +92,17 @@ def validate_reduced_pyramid_checkpoint(
             f"checkpoint={actual_channels}, config={expected_channels}. Full resume "
             "requires the same dit.pyramid_channels value."
         )
+
+
+def load_detector_checkpoint(
+    path: str | Path, *, expected_pyramid_channels: int
+) -> object:
+    """Load a detector checkpoint and validate its shared pyramid contract."""
+    checkpoint = safe_torch_load(path)
+    validate_reduced_pyramid_checkpoint(
+        checkpoint, expected_channels=expected_pyramid_channels
+    )
+    return checkpoint
 
 
 def _unwrap(checkpoint: object) -> dict[str, Tensor]:
@@ -174,11 +181,10 @@ def load_dit_pretrained(model: nn.Module, path: str | Path) -> LoadReport:
         del state[key]
     incompatible = model.load_state_dict(state, strict=False)
     loaded = set(state).intersection(model_state)
-    expected_blocks = {key for key in model_state if key.startswith("blocks.")}
-    missing_blocks = expected_blocks.difference(loaded)
-    if missing_blocks:
-        sample = ", ".join(sorted(missing_blocks)[:5])
-        raise RuntimeError(f"DiT transformer checkpoint is incomplete; missing {sample}")
+    missing_encoder_keys = set(model_state).difference(loaded)
+    if missing_encoder_keys:
+        sample = ", ".join(sorted(missing_encoder_keys)[:5])
+        raise RuntimeError(f"DiT encoder checkpoint is incomplete; missing {sample}")
     return LoadReport(
         path=str(path.resolve()),
         sha256=sha256_file(path),

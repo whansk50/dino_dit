@@ -9,10 +9,13 @@ ROOT = Path(__file__).parents[1]
 
 class SourceTests(unittest.TestCase):
     def test_python_sources_parse(self):
-        for path in ROOT.rglob("*.py"):
-            if "build" in path.parts:
-                continue
+        for path in (ROOT / "train.py", ROOT / "inference.py"):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for source_root in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
+            for path in source_root.rglob("*.py"):
+                if "build" in path.parts:
+                    continue
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_runtime_does_not_import_upstream_dit_wrapper(self):
         sources = "\n".join(
@@ -46,6 +49,18 @@ class SourceTests(unittest.TestCase):
             "args.resume = os.path.join(args.output_dir, 'checkpoint.pth')",
             source,
         )
+
+    def test_dino_integration_is_explicit_instead_of_monkey_patched(self):
+        backend = (
+            ROOT / "src" / "dit_layout_bench" / "backends" / "dino.py"
+        ).read_text(encoding="utf-8")
+        dispatcher = (
+            ROOT / "src" / "dit_layout_bench" / "backends" / "__init__.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("dino_model.build_backbone =", backend)
+        self.assertNotIn("dino_main.build_dataset =", backend)
+        self.assertIn("integration=_build_dino_integration(config)", backend)
+        self.assertNotIn("importlib", dispatcher)
 
 
 if __name__ == "__main__":

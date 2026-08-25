@@ -4,28 +4,37 @@
 
 ```text
 dit-dino-layout/
+├── train.py                      # 학습 공개 진입점
+├── inference.py                  # 단일/폴더 추론 및 가시화 진입점
 ├── src/dit_layout_bench/
-│   ├── resources/               # default.yaml과 DINO 내부 bridge
+│   ├── resources/               # detector별 기본 YAML과 DINO 내부 bridge
+│   ├── arguments.py            # train/inference 공통 인자와 config 생성
 │   ├── backends/                # 시작 시 detector 하나를 선택
 │   ├── models/dit.py            # MPViT 비사용 clean-room DiT-base
 │   ├── models/pyramid.py        # 공통 stride 4/8/16/32 pyramid + mask
 │   ├── checkpoint.py            # hash/키/shape 검증 및 pos-embed 보간
-│   ├── config.py                # strict YAML merge/validation
+│   ├── config.py                # detector 선택, strict YAML merge, RunConfig
+│   ├── settings_validation.py   # 공통 및 detector별 설정 값 검증
 │   ├── data.py, spec.py         # PubLayNet I/O와 category 단일 정의
-│   └── tracking.py              # 공통 MLflow run과 metric logger
-│   ├── _vendor/dino/            # Apache-2.0 DINO 고정 소스와 LICENSE
-├── train.py, evaluate.py, inference.py
+│   ├── tracking.py              # 공통 MLflow run과 metric logger
+│   └── _vendor/dino/            # Apache-2.0 DINO 고정 소스와 LICENSE
 └── tests/
 ```
 
 상위 workspace의 `dit/`와 `DINO/`는 조사용일 뿐 runtime dependency가 아니다.
-`get_backend()`가 프로세스 시작 시 `--detector` 값으로 모듈 하나만 import하므로
-forward 내부에 detector 조건 분기가 없다.
+`get_backend()`가 프로세스 시작 시 `--detector` 값에 해당하는 백엔드만 import하고
+`train`/`build_predictor` 연산을 반환하므로 forward 내부에 detector 조건 분기가 없다.
 
-## 2. huggingface conda 환경 설치
+백엔드 선택은 일반 Python 분기로 `cascade_rcnn` 또는 `dino`를 직접 lazy import한다.
+DINO adapter의 `importlib` 사용은 upstream `main.py`가 `engine`, `models`, `util`을
+최상위 모듈명으로 import하는 구조를 충돌 없는 별칭으로 한 번 로드하는 데만 남겨
+두었다. Backbone, PubLayNet dataset, optimizer group, evaluation logging 및 train-step
+logging은 monkey-patch하지 않고 `DinoIntegration` callback으로 DINO `main()`에
+명시적으로 전달한다.
+
+## 2. 환경 설치
 
 ```bash
-conda activate huggingface
 cd /workspace/dino_dit/dit-dino-layout
 python -m pip install -e .
 ```
@@ -67,7 +76,10 @@ embedding은 class token을 분리한 뒤 bicubic 보간한다. Pyramid와 detec
 
 ## 5. 동일 I/O와 feature 흐름
 
-두 backend의 공통 정책은 `src/dit_layout_bench/resources/default.yaml` 한 곳에서 읽는다.
+두 backend는 동일한 공통 key 계약을 유지하지만 기본 YAML은 분리되어 있다.
+`resources/dino.yaml`에는 `dino` 섹션만, `resources/cascade_rcnn.yaml`에는
+`cascade_rcnn` 섹션만 존재한다. DINO DataLoader prefetch나 EMA처럼 다른
+backend가 소비하지 않는 key도 상대 config에는 넣지 않는다.
 
 ```text
 RGB → horizontal flip(train) → short edge 480..800 / long edge ≤1333
@@ -81,16 +93,18 @@ RGB → horizontal flip(train) → short edge 480..800 / long edge ≤1333
 
 ## 6. YAML 설정
 
-우선순위는 `default.yaml → --config partial.yaml → --options → 전용 CLI flag`다.
-알 수 없는 key나 기본값과 타입이 다른 값은 거부한다.
+우선순위는 `detector별 기본 YAML → --config → --options → 전용 CLI flag`다.
+알 수 없는 key나 기본값과 타입이 다른 값은 거부한다. config의
+`run.detector`와 `--detector`가 다르면 실행하지 않으므로 DINO 설정을 Cascade에
+잘못 적용하거나 그 반대가 되는 일을 막는다.
 
-`configs/dino_train.yaml`은 DINO 학습에 필요한 실행 경로와 실험 설정을
-버전 관리한다. 새 실험은 이 파일을 복사해 수정한다. 일회성 비교 실험에만
-`--options training.batch_size=4`와 같은 override를 사용한다.
+`configs/dino_train.yaml`과 `configs/cascade_rcnn_train.yaml`이 각각의 실행 경로와
+실험 설정을 버전 관리한다. 새 실험은 해당 detector 파일을 복사해 수정한다.
+일회성 비교 실험에만 `--options training.batch_size=4`와 같은 override를 사용한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 torchrun --standalone --nproc-per-node=gpu \
-  --numa-binding=node train.py --config configs/dino_train.yaml
+python train.py --devices 2 \
+  --config configs/dino_train.yaml
 ```
 
 ## 7. 학습, 평가, 추론
@@ -98,41 +112,48 @@ CUDA_VISIBLE_DEVICES=2 torchrun --standalone --nproc-per-node=gpu \
 ```bash
 python train.py --config configs/dino_train.yaml
 
-# 보이는 GPU 수에 따라 single/DDP 자동 선택 (DINO backend)
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=gpu \
-  --numa-binding=node \
-  train.py --config configs/dino_train.yaml
+python train.py --config configs/cascade_rcnn_train.yaml
+
+# train.py가 선택한 GPU마다 PyTorch DDP process를 하나씩 실행
+python train.py --devices 0,1 --config configs/dino_train.yaml
 
 # 완료된 마지막 epoch부터 명시적으로 학습 재개
-python train.py --config configs/dino_train.yaml \
-  --resume outputs/dino-fpn256/checkpoint.pth
+python train.py --config configs/dino_train.yaml --resume
 
-python evaluate.py --detector dino --data-root /data/publaynet \
-  --resume outputs/dino-fpn256/checkpoint.pth
-
-python inference.py --detector dino --resume outputs/dino-fpn256/checkpoint.pth \
+python inference.py --detector dino \
+  --weights-dir outputs/dino-fpn256/weights --resume \
   --image page.jpg --json-output prediction.json
+
+# 폴더 안의 모든 지원 이미지 추론 및 박스 가시화
+python inference.py --config configs/dino_train.yaml --resume \
+  --image pages --json-output outputs/predictions.json \
+  --visualization-dir outputs/visualizations
+
+python inference.py --config configs/cascade_rcnn_train.yaml --resume \
+  --image pages --json-output outputs/cascade-predictions.json
 ```
 
 `--resume`을 지정한 경우에만 모델, optimizer, LR scheduler 및 완료 epoch를
-복원한다. resume에는 detector 전체 가중치가 있으므로 `paths.pretrained`는
-생략할 수 있다. 출력 디렉터리에 기존 `checkpoint.pth`가 있더라도
+`paths.weights_dir/recent.pth`에서 복원한다. 다른 디렉터리나 파일명은 탐색하지
+않는다. resume에는 detector 전체 가중치가 있으므로 `paths.pretrained`는 무시한다.
 `--resume`을 생략하면 pretrained 가중치에서 새 학습을 시작한다.
 
-DDP는 `torchrun`의 `RANK`, `WORLD_SIZE`, `LOCAL_RANK`를 감지해 자동 활성화된다.
-일반 `python train.py ...` 실행은 기존 단일 GPU 동작을 유지한다. DINO의
-`training.batch_size`와 `run.num_workers`는 GPU(process)당 값이므로 위 2-GPU
-예제의 global batch는 `2 × training.batch_size`이고 DataLoader worker 수도
-전체적으로 `2 × run.num_workers`가 된다. global batch가 달라지면 learning
-rate와 수렴 특성이 달라질 수 있으므로 동일 조건 비교 시 이를 함께 기록한다.
+`--devices`에 GPU ID를 두 개 이상 지정하면 `train.py`가
+`torch.multiprocessing.spawn`으로 process를 만들고, 각 process에서
+`torch.distributed`와 `DistributedDataParallel`을 초기화한다. `--devices`를
+생략하거나 하나만 지정하면 단일 process로 실행한다. ID는 PyTorch에 현재
+보이는 CUDA device 기준이며 기존 `CUDA_VISIBLE_DEVICES`를 덮어쓰지 않는다. DINO의
+`training.batch_size`는 global batch이고 `run.num_workers`는 GPU(process)당
+값이다. 위 설정의 global batch 6을 GPU 두 장에서 실행하면 GPU당 batch는 3이며,
+전체 DataLoader worker 수는 `2 × run.num_workers`가 된다. global batch가
+world size로 나누어떨어지지 않으면 process 생성 전에 실행을 거부한다.
 checkpoint, config, log 및 MLflow run은 global rank 0만 기록하고, 평가 예측과
 loss 통계는 모든 rank에서 모은다. 같은 pyramid 설정의 DDP checkpoint는 단일
 GPU와 상호 호환된다.
 
 현재 서버는 NVLink가 연결되어 있지 않고 GPU `0,1`과 `2,3`이 각각 같은 NUMA
-측에 있다. 2-GPU 실행은 `CUDA_VISIBLE_DEVICES=0,1` 또는 `2,3`을 사용하고
-`--numa-binding=node`를 유지한다. GPU 선택은 launcher/scheduler의 자원 할당
-영역이므로 학습 코드가 임의로 바꾸지 않는다.
+측에 있다. 2-GPU 실행은 `--devices 0,1` 또는 `--devices 2,3`을 사용한다.
+NUMA binding은 scheduler의 자원 할당 영역이며 학습 코드가 변경하지 않는다.
 
 현재 pyramid는 네 stride-16 DiT tap을 먼저 768→256으로 projection한 뒤
 P2/P3/P4/P5로 변환한다. 이전 768채널 pyramid와는 projection 및 transposed-conv
@@ -143,14 +164,14 @@ DiT encoder 자체의 parameter shape는 바뀌지 않았으므로 동일한 sel
 회귀 비교 조건은 [TODO.md](TODO.md)에 기록했다.
 
 DataLoader는 pinned memory와 non-blocking H2D를 사용하고 train worker만 epoch
-사이에 유지한다. `training.batch_size`, `run.num_workers`, prefetch는 rank당
-값이다. Adam/AdamW fused optimizer는 CUDA에서만 켜고, DDP는 gradient bucket
-view와 static graph를 사용한다. AMP dtype은 FP16으로 고정한다.
+사이에 유지한다. `training.batch_size`는 global 값이고, `run.num_workers`와
+prefetch는 rank당 값이다. Adam/AdamW fused optimizer는 CUDA에서만 켜고, DDP는
+gradient bucket view와 static graph를 사용한다. AMP dtype은 FP16으로 고정한다.
 
 DINO의 linear warmup은 첫 epoch 안에서 `training.warmup_iters`만큼 적용된다.
 평가는 `training.evaluate_every_epochs` 주기와 마지막 epoch에 실행한다.
-`checkpoint.pth`는 안전한 재개를 위해 매 epoch 갱신하고, 번호가 붙은 보관본은
-`training.checkpoint_every_epochs` 주기로 저장한다.
+validation이 성공할 때마다 `paths.weights_dir/recent.pth`를 고정된 재개 대상으로
+갱신한다. 마지막 epoch에도 validation을 실행하므로 이 파일이 최종 가중치가 된다.
 
 Backbone parameter는 기본 LR `1e-5`, pyramid/detector는 `1e-4`의 별도 AdamW
 group에 들어간다. DINO는 epoch loop, Cascade는 annotation image 수를 기준으로

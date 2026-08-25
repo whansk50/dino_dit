@@ -8,6 +8,8 @@ import math
 import os
 from typing import Any, Mapping
 
+from dit_layout_bench.config import RunConfig
+
 
 _ACTIVE: ContextVar["MLflowTracker | None"] = ContextVar("mlflow_tracker", default=None)
 
@@ -54,7 +56,7 @@ def _flatten(values: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
 
 @dataclass
 class MLflowTracker:
-    config: Any
+    config: RunConfig
     action: str
     _mlflow: Any = None
     _token: Any = None
@@ -66,7 +68,7 @@ class MLflowTracker:
     def __enter__(self) -> "MLflowTracker":
         self._token = _ACTIVE.set(self)
         # The tracker is created before DINO initializes torch.distributed, so
-        # use torchrun/Slurm environment variables to keep MLflow rank-zero-only.
+        # use launcher/Slurm environment variables to keep MLflow rank-zero-only.
         if not self.enabled or process_rank() != 0:
             return self
         try:
@@ -90,14 +92,20 @@ class MLflowTracker:
             },
         )
         mlflow.log_params(_flatten(self.config.settings))
-        mlflow.log_params(
-            {
-                "runtime.world_size": process_world_size(),
-                "runtime.global_batch_size": (
-                    self.config.batch_size * process_world_size()
-                ),
-            }
-        )
+        world_size = process_world_size()
+        runtime_params = {"runtime.world_size": world_size}
+        if self.action == "train":
+            from dit_layout_bench.config import per_process_batch_size
+
+            runtime_params.update(
+                {
+                    "runtime.batch_size_per_gpu": per_process_batch_size(
+                        self.config.batch_size, world_size
+                    ),
+                    "runtime.global_batch_size": self.config.batch_size,
+                }
+            )
+        mlflow.log_params(runtime_params)
         mlflow.log_dict(self.config.settings, "effective-config.yaml")
         return self
 

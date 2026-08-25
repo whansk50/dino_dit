@@ -1,33 +1,60 @@
 import argparse
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
-import sqlite3
-import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
 from dit_layout_bench.config import RunConfig, load_settings
-from dit_layout_bench.cli import _config, _parser, _validated_config
-from dit_layout_bench.checkpoint import _safe_torch_load
+from dit_layout_bench.arguments import build_config, parser_for, validated_config
+from dit_layout_bench.checkpoint import load_dit_pretrained, safe_torch_load
 from dit_layout_bench.backends.dino import (
     _activate_dino,
+    _build_dino_integration,
+    _effective_dino_values,
     _evaluation_metrics,
-    _patched_dino_runtime,
     _runner_arguments,
 )
+from train import _distributed_worker, _parse_devices
 from dit_layout_bench.data import validate_publaynet
 from dit_layout_bench.optim import parameter_groups
-from dit_layout_bench.prediction import prediction_record
+from dit_layout_bench.prediction import (
+    collect_image_paths,
+    prediction_record,
+    save_visualization,
+)
 from dit_layout_bench.spec import category_id_to_train_label, train_label_to_category_id
 from dit_layout_bench.tracking import MLflowTracker, process_rank, process_world_size
 
 FIXTURE = Path(__file__).parent / "fixtures" / "publaynet"
+
+
+def _write_publaynet_fixture(root: Path) -> None:
+    categories = [
+        {"id": 1, "name": "Text"},
+        {"id": 2, "name": "Title"},
+        {"id": 3, "name": "List"},
+        {"id": 4, "name": "Table"},
+        {"id": 5, "name": "Figure"},
+    ]
+    (root / "annotations").mkdir(parents=True)
+    for index, split in enumerate(("train", "val"), start=1):
+        (root / split).mkdir()
+        document = {
+            "images": [{"id": index, "file_name": f"{split}.jpg"}],
+            "annotations": [],
+            "categories": categories,
+        }
+        (root / "annotations" / f"{split}.json").write_text(
+            json.dumps(document), encoding="utf-8"
+        )
 
 
 class ContractTests(unittest.TestCase):
@@ -38,9 +65,26 @@ class ContractTests(unittest.TestCase):
                 {"value": np.float64(1.25), "args": argparse.Namespace(epoch=1)},
                 checkpoint,
             )
-            loaded = _safe_torch_load(checkpoint)
+            loaded = safe_torch_load(checkpoint)
             self.assertEqual(float(loaded["value"]), 1.25)
             self.assertEqual(loaded["args"].epoch, 1)
+
+    def test_incomplete_encoder_checkpoint_is_rejected(self):
+        class TinyEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList(
+                    [torch.nn.Linear(1, 1, bias=False)]
+                )
+                self.patch_embed = torch.nn.Linear(1, 1, bias=False)
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "incomplete.pth"
+            torch.save(
+                {"model": {"blocks.0.weight": torch.ones(1, 1)}}, checkpoint
+            )
+            with self.assertRaisesRegex(RuntimeError, "patch_embed.weight"):
+                load_dit_pretrained(TinyEncoder(), checkpoint)
 
     def test_category_mapping_round_trip(self):
         for category_id in range(1, 6):
@@ -54,23 +98,21 @@ class ContractTests(unittest.TestCase):
             category_id_to_train_label(0)
 
     def test_dataset_layout_and_config(self):
-        summaries = validate_publaynet(FIXTURE)
-        self.assertEqual([item.images for item in summaries], [1, 1])
-        RunConfig("dino", FIXTURE, FIXTURE / "out", None).validate()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_publaynet_fixture(root)
+            summaries = validate_publaynet(root)
+            self.assertEqual([item.images for item in summaries], [1, 1])
+            RunConfig("dino", root, root / "out", None).validate()
 
     def test_dataset_category_names_must_match_publaynet_mapping(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "annotations").mkdir()
-            for split in ("train", "val"):
-                (root / split).mkdir()
-                source = FIXTURE / "annotations" / f"{split}.json"
-                document = json.loads(source.read_text(encoding="utf-8"))
-                if split == "train":
-                    document["categories"][0]["name"] = "Figure"
-                (root / "annotations" / f"{split}.json").write_text(
-                    json.dumps(document), encoding="utf-8"
-                )
+            _write_publaynet_fixture(root)
+            annotation = root / "annotations" / "train.json"
+            document = json.loads(annotation.read_text(encoding="utf-8"))
+            document["categories"][0]["name"] = "Figure"
+            annotation.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "category mapping must be exactly"):
                 validate_publaynet(root)
 
@@ -81,9 +123,46 @@ class ContractTests(unittest.TestCase):
     def test_cascade_detector_uses_cascade_yaml_section(self):
         config = RunConfig(
             "cascade_rcnn", FIXTURE, FIXTURE / "out", None,
-            settings=load_settings(options=["run.detector=cascade_rcnn"]),
+            settings=load_settings(detector="cascade_rcnn"),
         )
         self.assertEqual(config.detector_settings["anchor_sizes"], [32, 64, 128, 256])
+
+    def test_detector_configs_have_no_other_backend_section(self):
+        dino = load_settings(detector="dino")
+        cascade = load_settings(detector="cascade_rcnn")
+        self.assertIn("dino", dino)
+        self.assertNotIn("cascade_rcnn", dino)
+        self.assertIn("cascade_rcnn", cascade)
+        self.assertNotIn("dino", cascade)
+        self.assertIn("prefetch_factor", dino["training"])
+        self.assertNotIn("prefetch_factor", cascade["training"])
+
+    def test_example_configs_select_matching_schema(self):
+        root = Path(__file__).parents[1] / "configs"
+        dino = load_settings(root / "dino_train.yaml")
+        cascade = load_settings(root / "cascade_rcnn_train.yaml")
+        self.assertEqual(dino["run"]["detector"], "dino")
+        self.assertEqual(cascade["run"]["detector"], "cascade_rcnn")
+
+    def test_cli_detector_cannot_conflict_with_config(self):
+        parser = parser_for("train")
+        config_path = Path(__file__).parents[1] / "configs" / "dino_train.yaml"
+        args = parser.parse_args(
+            ["--detector", "cascade_rcnn", "--config", str(config_path)]
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            build_config(args, require_data=False)
+
+    def test_runtime_detector_must_match_settings(self):
+        config = RunConfig(
+            "cascade_rcnn",
+            FIXTURE,
+            FIXTURE / "out",
+            None,
+            settings=load_settings(detector="dino"),
+        )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            config.validate(require_data=False)
 
     def test_optimizer_split_keeps_pyramid_at_detector_lr(self):
         class Parameter:
@@ -128,24 +207,44 @@ class ContractTests(unittest.TestCase):
 
     def test_detector_numeric_ranges_are_validated(self):
         cases = (
-            ("dino.score_threshold=1.1", "dino.score_threshold"),
-            ("cascade.score_threshold=-0.1", "cascade.score_threshold"),
-            ("cascade.anchor_sizes=[32,64,128,0]", "cascade.anchor_sizes"),
-            ("cascade.aspect_ratios=[0.5,0,2.0]", "cascade.aspect_ratios"),
-            ("cascade.roi_batch_size_per_image=0", "roi_batch_size_per_image"),
-            ("cascade.rpn_batch_size_per_image=0", "rpn_batch_size_per_image"),
+            ("dino", "dino.score_threshold=1.1", "dino.score_threshold"),
+            (
+                "cascade_rcnn",
+                "cascade_rcnn.score_threshold=-0.1",
+                "cascade_rcnn.score_threshold",
+            ),
+            (
+                "cascade_rcnn",
+                "cascade_rcnn.anchor_sizes=[32,64,128,0]",
+                "cascade_rcnn.anchor_sizes",
+            ),
+            (
+                "cascade_rcnn",
+                "cascade_rcnn.aspect_ratios=[0.5,0,2.0]",
+                "cascade_rcnn.aspect_ratios",
+            ),
+            (
+                "cascade_rcnn",
+                "cascade_rcnn.roi_batch_size_per_image=0",
+                "roi_batch_size_per_image",
+            ),
+            (
+                "cascade_rcnn",
+                "cascade_rcnn.rpn_batch_size_per_image=0",
+                "rpn_batch_size_per_image",
+            ),
         )
-        for option, message in cases:
+        for detector, option, message in cases:
             with self.subTest(option=option):
-                settings = load_settings(options=[option])
+                settings = load_settings(options=[option], detector=detector)
                 config = RunConfig(
-                    "dino", FIXTURE, FIXTURE / "out", None, settings=settings
+                    detector, FIXTURE, FIXTURE / "out", None, settings=settings
                 )
                 with self.assertRaisesRegex(ValueError, message):
-                    config.validate()
+                    config.validate(require_data=False)
 
     def test_inference_cli_rejects_invalid_score_threshold(self):
-        parser = _parser("inference")
+        parser = parser_for("inference")
         with self.assertRaises(SystemExit):
             parser.parse_args(
                 ["--image", str(__file__), "--score-threshold", "nan"]
@@ -158,10 +257,10 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(settings["input"]["max_long_edge"], 1333)
 
     def test_dedicated_cli_flag_wins_and_updates_effective_settings(self):
-        args = _parser("train").parse_args(
+        args = parser_for("train").parse_args(
             ["--options", "training.epochs=5", "--epochs", "7"]
         )
-        config = _config(args, require_data=False)
+        config = build_config(args, require_data=False)
         self.assertEqual(config.epochs, 7)
         self.assertEqual(config.training["epochs"], 7)
 
@@ -176,6 +275,85 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prediction_record("page", Box(), 0.75, 0)
 
+    def test_inference_collects_folder_images_in_stable_order(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("b.PNG", "a.jpg", "notes.txt"):
+                (root / name).touch()
+            self.assertEqual(
+                [path.name for path in collect_image_paths(root)],
+                ["a.jpg", "b.PNG"],
+            )
+
+    def test_inference_visualization_is_saved(self):
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "page.png"
+            output = root / "visualized" / "page.prediction.png"
+            Image.new("RGB", (100, 80), "white").save(source)
+            saved = save_visualization(
+                source,
+                [
+                    {
+                        "image_id": "page",
+                        "box_xyxy": [10.0, 10.0, 60.0, 50.0],
+                        "score": 0.9,
+                        "category_id": 1,
+                    }
+                ],
+                output,
+            )
+            self.assertEqual(saved, output)
+            self.assertTrue(output.is_file())
+
+    def test_folder_inference_loads_model_once(self):
+        from PIL import Image
+        import inference as inference_cli
+
+        class Tracker:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def log_metrics(self, metrics):
+                self.metrics = metrics
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("one.jpg", "two.png"):
+                Image.new("RGB", (8, 8), "white").save(root / name)
+            config = SimpleNamespace(
+                detector="dino",
+                output_dir=root / "output",
+                score_threshold=lambda: 0.5,
+            )
+            predictor = Mock(return_value=[])
+            backend = SimpleNamespace(build_predictor=Mock(return_value=predictor))
+            with patch.object(
+                inference_cli, "validated_config", return_value=config
+            ), patch.object(
+                inference_cli, "MLflowTracker", return_value=Tracker()
+            ), patch.object(
+                inference_cli, "get_backend", return_value=backend
+            ), redirect_stdout(io.StringIO()):
+                inference_cli.main(
+                    ["--image", str(root), "--resume", "--no-visualize"]
+                )
+            backend.build_predictor.assert_called_once_with(
+                config, score_threshold=0.5
+            )
+            self.assertEqual(predictor.call_count, 2)
+            self.assertTrue(
+                all(
+                    len(call.args) == 1 and not call.kwargs
+                    for call in predictor.call_args_list
+                )
+            )
+
     def test_dino_runner_receives_effective_common_config(self):
         settings = load_settings(
             options=["training.epochs=3", "dino.num_queries=123"]
@@ -188,12 +366,14 @@ class ContractTests(unittest.TestCase):
             epochs=3,
             settings=settings,
         )
-        arguments = _runner_arguments(config, evaluate=False)
+        arguments = _runner_arguments(config)
+        self.assertIn("batch_size=2", arguments)
         self.assertIn("epochs=3", arguments)
         self.assertIn("num_queries=123", arguments)
         self.assertIn("data_norm_mean=0.5,0.5,0.5", arguments)
         self.assertIn("warmup_iters=1000", arguments)
         self.assertIn("evaluate_every_epochs=1", arguments)
+        self.assertIn("weights_dir=weights", arguments)
         self.assertIn("optimizer=adamw", arguments)
         self.assertIn("fused_optimizer=True", arguments)
         self.assertIn("adam_betas=0.9,0.999", arguments)
@@ -227,41 +407,67 @@ class ContractTests(unittest.TestCase):
             None,
             settings=settings,
         )
-        self.assertNotIn("--resume", _runner_arguments(without_resume, evaluate=False))
+        self.assertNotIn("--resume", _runner_arguments(without_resume))
 
-        checkpoint = FIXTURE / "detector.pth"
+        checkpoint = FIXTURE / "recent.pth"
         with_resume = RunConfig(
             "dino",
             FIXTURE,
             FIXTURE / "out",
             None,
+            weights_dir=FIXTURE,
             resume=checkpoint,
             settings=settings,
         )
-        arguments = _runner_arguments(with_resume, evaluate=False)
+        arguments = _runner_arguments(with_resume)
         resume_index = arguments.index("--resume")
         self.assertEqual(arguments[resume_index + 1], str(checkpoint))
 
     def test_resume_training_does_not_require_redundant_pretrained_path(self):
         with TemporaryDirectory() as directory:
-            checkpoint = Path(directory) / "checkpoint.pth"
+            weights_dir = Path(directory) / "weights"
+            weights_dir.mkdir()
+            checkpoint = weights_dir / "recent.pth"
             checkpoint.touch()
-            args = _parser("train").parse_args(
+            missing_pretrained = Path(directory) / "missing-pretrained.pth"
+            args = parser_for("train").parse_args(
                 [
-                    "--data-root",
-                    str(FIXTURE),
+                    "--weights-dir",
+                    str(weights_dir),
+                    "--pretrained",
+                    str(missing_pretrained),
                     "--resume",
-                    str(checkpoint),
                 ]
             )
-            config = _validated_config(
-                _parser("train"),
+            config = validated_config(
+                parser_for("train"),
                 args,
-                require_data=True,
+                require_data=False,
                 require_pretrained=True,
             )
-            self.assertIsNone(config.pretrained)
+            self.assertEqual(config.pretrained, missing_pretrained)
+            self.assertEqual(config.weights_dir, weights_dir)
             self.assertEqual(config.resume, checkpoint)
+
+    def test_resume_does_not_accept_an_external_checkpoint_path(self):
+        parser = parser_for("train")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--resume", "outside.pth"])
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside.pth"
+            outside.touch()
+            config = RunConfig(
+                "dino",
+                root,
+                root / "output",
+                None,
+                resume=outside,
+                weights_dir=root / "weights",
+                settings=load_settings(),
+            )
+            with self.assertRaisesRegex(ValueError, "weights_dir/recent.pth"):
+                config.validate(require_data=False)
 
     def test_mlflow_settings_are_versioned_in_yaml(self):
         settings = load_settings()
@@ -284,8 +490,7 @@ class ContractTests(unittest.TestCase):
         import mlflow
 
         with TemporaryDirectory() as directory:
-            database = Path(directory) / "tracking.db"
-            tracking_uri = f"sqlite:///{database}"
+            tracking_uri = (Path(directory) / "mlruns").as_uri()
             settings = {
                 "tracking": {
                     "enabled": True,
@@ -300,57 +505,52 @@ class ContractTests(unittest.TestCase):
                 detector="dino",
                 batch_size=1,
             )
-            dino_main = SimpleNamespace(
-                build_dataset=object(),
-                get_param_dict=object(),
-                evaluate=lambda *args, **kwargs: (
-                    {
-                        "loss": (
-                            float(kwargs["args"]._tracking_eval_epoch)
-                            if kwargs["args"]._tracking_eval_prefix == "eval"
-                            else float(kwargs["args"]._tracking_eval_epoch + 10)
-                        ),
-                        "coco_eval_bbox": [0.42, 0.61, 0.45],
-                    },
-                    SimpleNamespace(coco_eval={"bbox": object()}),
-                ),
-            )
-            dino_model = SimpleNamespace(build_backbone=object())
-            fake_engine = SimpleNamespace(TRAIN_STEP_CALLBACK=None)
             previous_uri = mlflow.get_tracking_uri()
             try:
-                with patch.dict(sys.modules, {"engine": fake_engine}), patch(
+                with patch.dict(
+                    os.environ, {"MLFLOW_ALLOW_FILE_STORE": "true"}
+                ), patch(
                     "dit_layout_bench.evaluation.print_per_category_ap",
                     return_value={"Text": 91.0},
                 ):
                     with MLflowTracker(config, "train"):
-                        with _patched_dino_runtime(dino_main, dino_model):
-                            for epoch in (1, 2):
-                                dino_main.evaluate(
-                                    args=SimpleNamespace(
-                                        _tracking_eval_epoch=epoch,
-                                        _tracking_eval_prefix="eval",
-                                    )
+                        integration = _build_dino_integration(config)
+                        for epoch in (1, 2):
+                            for prefix in ("eval", "eval_ema"):
+                                loss = float(
+                                    epoch if prefix == "eval" else epoch + 10
                                 )
-                                dino_main.evaluate(
-                                    args=SimpleNamespace(
+                                integration.on_evaluation(
+                                    {
+                                        "loss": loss,
+                                        "coco_eval_bbox": [0.42, 0.61, 0.45],
+                                    },
+                                    SimpleNamespace(coco_eval={"bbox": object()}),
+                                    SimpleNamespace(
                                         _tracking_eval_epoch=epoch,
-                                        _tracking_eval_prefix="eval_ema",
-                                    )
+                                        _tracking_eval_prefix=prefix,
+                                    ),
                                 )
             finally:
                 mlflow.set_tracking_uri(previous_uri)
 
-            connection = sqlite3.connect(database)
-            rows = connection.execute(
-                "SELECT key, step, value FROM metrics "
-                "WHERE key IN ("
-                "'eval/loss', 'eval/bbox_mAP', 'eval/AP_Text', "
-                "'eval_ema/loss', 'eval_ema/bbox_mAP', 'eval_ema/AP_Text'"
-                ") "
-                "ORDER BY key, step"
-            ).fetchall()
-            connection.close()
+            with patch.dict(os.environ, {"MLFLOW_ALLOW_FILE_STORE": "true"}):
+                client = mlflow.MlflowClient(tracking_uri=tracking_uri)
+                experiment = client.get_experiment_by_name("integration-test")
+                run = client.search_runs([experiment.experiment_id])[0]
+                keys = (
+                    "eval/loss",
+                    "eval/bbox_mAP",
+                    "eval/AP_Text",
+                    "eval_ema/loss",
+                    "eval_ema/bbox_mAP",
+                    "eval_ema/AP_Text",
+                )
+                rows = sorted(
+                    (metric.key, metric.step, metric.value)
+                    for key in keys
+                    for metric in client.get_metric_history(run.info.run_id, key)
+                )
             self.assertEqual(
                 rows,
                 [
@@ -369,7 +569,7 @@ class ContractTests(unittest.TestCase):
                 ],
             )
 
-    def test_tracking_reads_torchrun_topology_before_process_group_init(self):
+    def test_tracking_reads_launcher_topology_before_process_group_init(self):
         environment = {"RANK": "3", "WORLD_SIZE": "8", "LOCAL_RANK": "1"}
         with patch.dict(os.environ, environment, clear=True):
             self.assertEqual(process_rank(), 3)
@@ -380,9 +580,85 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(process_rank(), 0)
             self.assertEqual(process_world_size(), 1)
 
-    def test_torchrun_rejects_backend_without_ddp_integration(self):
+    def test_internal_ddp_device_list_is_explicit_and_validated(self):
+        self.assertEqual(_parse_devices("2,3"), (2, 3))
+        for value in ("", "0,0", "0,cuda", "-1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_devices(value)
+
+    def test_internal_ddp_worker_maps_rank_to_selected_device(self):
+        import train as train_entry
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            train_entry, "main"
+        ) as worker_main:
+            _distributed_worker(1, 2, (2, 3), ("--devices", "2,3"), "127.0.0.1", 1234)
+            self.assertEqual(os.environ["RANK"], "1")
+            self.assertEqual(os.environ["WORLD_SIZE"], "2")
+            self.assertEqual(os.environ["LOCAL_RANK"], "3")
+            worker_main.assert_called_once_with(
+                ["--devices", "2,3"], _internal_worker=True
+            )
+
+    def test_global_batch_is_divided_per_gpu(self):
+        settings = load_settings(options=["training.batch_size=6"])
+        config = RunConfig(
+            "dino",
+            FIXTURE,
+            FIXTURE / "out",
+            None,
+            batch_size=6,
+            settings=settings,
+        )
         environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
-        parser = _parser("train")
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(_effective_dino_values(config)["batch_size"], 3)
+
+    def test_inference_does_not_apply_training_batch_partition(self):
+        settings = load_settings(options=["training.batch_size=5"])
+        config = RunConfig(
+            "dino",
+            FIXTURE,
+            FIXTURE / "out",
+            None,
+            batch_size=5,
+            settings=settings,
+        )
+        environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        with patch.dict(os.environ, environment, clear=True):
+            values = _effective_dino_values(config, for_training=False)
+        self.assertEqual(values["batch_size"], 5)
+
+    def test_non_divisible_global_batch_is_rejected_before_training(self):
+        parser = parser_for("train")
+        args = parser.parse_args(["--batch-size", "5"])
+        environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        with patch.dict(os.environ, environment, clear=True), self.assertRaises(
+            SystemExit
+        ):
+            validated_config(
+                parser,
+                args,
+                require_data=False,
+                require_pretrained=False,
+                training=True,
+            )
+
+    def test_train_entrypoint_launches_internal_ddp(self):
+        import train as train_entry
+
+        config = SimpleNamespace(detector="dino", device="cuda", batch_size=4)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            train_entry, "validated_config", return_value=config
+        ), patch.object(
+            train_entry, "_validate_cuda_devices"
+        ), patch.object(train_entry, "_launch_distributed") as launch:
+            train_entry.main(["--devices", "0,1"])
+        launch.assert_called_once_with((0, 1), ["--devices", "0,1"])
+
+    def test_ddp_rejects_backend_without_distributed_integration(self):
+        environment = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        parser = parser_for("train")
         args = parser.parse_args(
             [
                 "--detector",
@@ -395,10 +671,11 @@ class ContractTests(unittest.TestCase):
         )
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaises(SystemExit):
-                _validated_config(
+                validated_config(
                     parser,
                     args,
-                    require_data=True,
+                    require_data=False,
+                    training=True,
                     require_pretrained=True,
                 )
 

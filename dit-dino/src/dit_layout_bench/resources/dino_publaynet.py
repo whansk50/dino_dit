@@ -1,6 +1,6 @@
 # Internal bridge to IDEA DINO's SLConfig format.
-# User-editable defaults belong in default.yaml; the runtime forwards them here
-# through --options so Cascade R-CNN and DINO share one configuration surface.
+# User-editable DINO defaults belong in dino.yaml; the runtime forwards them
+# here through --options while preserving the upstream SLConfig bridge.
 _base_ = ['../_vendor/dino/config/DINO/DINO_4scale.py']
 
 # PubLayNet uses category IDs 1..5. DINO expects max category ID + 1.
@@ -37,6 +37,7 @@ scheduler = 'step'
 warmup_iters = 1000
 warmup_factor = 0.001
 evaluate_every_epochs = 1
+weights_dir = 'weights'
 data_pin_memory = True
 data_non_blocking = True
 data_persistent_workers = True

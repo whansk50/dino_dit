@@ -1,0 +1,51 @@
+run:
+  detector: cascade_rcnn
+  device: cuda
+  seed: 42
+  num_workers: 8
+  amp: true
+
+paths:
+  data_root: ./publaynet
+  output_dir: outputs/cascade-rcnn-fpn256
+  weights_dir: outputs/cascade-rcnn-fpn256/weights
+  pretrained: ./dit-base-224-p16-500k-62d53a.pth
+
+training:
+  batch_size: 2
+  epochs: 12
+  detector_lr: 1.0e-4
+  backbone_lr: 1.0e-5
+  weight_decay: 0.05
+  warmup_iters: 1000
+  warmup_factor: 0.001
+  evaluate_every_epochs: 1
+
+input:
+  short_edge_scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+  max_long_edge: 1333
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+  random_flip: horizontal
+
+dit:
+  drop_path: 0.1
+  use_checkpoint: true
+  pyramid_channels: 256
+
+cascade_rcnn:
+  score_threshold: 0.5
+  anchor_sizes: [32, 64, 128, 256]
+  aspect_ratios: [0.5, 1.0, 2.0]
+  lr_steps: [0.75, 0.9]
+  class_agnostic_bbox: true
+  roi_batch_size_per_image: 512
+  rpn_batch_size_per_image: 256
+  nms_threshold: 0.5
+
+tracking:
+  enabled: true
+  tracking_uri: sqlite:///mlflow.db
+  experiment_name: dit-cascade-rcnn-publaynet
+  run_name: ""
+  log_every_steps: 20

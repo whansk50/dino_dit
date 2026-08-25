@@ -25,6 +25,7 @@ from dit_layout_bench.checkpoint import (
     safe_torch_load,
     validate_reduced_pyramid_checkpoint,
 )
+from dit_layout_bench.paths import RECENT_CHECKPOINT_NAME
 
 
 
@@ -82,15 +83,14 @@ def get_args_parser():
     return parser
 
 
-def build_model_main(args):
-    # we use register to maintain models from catdet6 on.
-    from models.registry import MODULE_BUILD_FUNCS
-    assert args.modelname in MODULE_BUILD_FUNCS._module_dict
-    build_func = MODULE_BUILD_FUNCS.get(args.modelname)
-    model, criterion, postprocessors = build_func(args)
-    return model, criterion, postprocessors
+def build_model_main(args, *, backbone_builder=None):
+    if args.modelname != 'dino':
+        raise ValueError('Unsupported model: {}'.format(args.modelname))
+    from models.dino.dino import build_dino
 
-def main(args):
+    return build_dino(args, backbone_builder=backbone_builder)
+
+def main(args, integration=None):
     utils.init_distributed_mode(args)
     # load cfg file and update the args
     print("Loading config file from {}".format(args.config_file))
@@ -147,7 +147,9 @@ def main(args):
     random.seed(seed)
 
     # build model
-    model, criterion, postprocessors = build_model_main(args)
+    model, criterion, postprocessors = build_model_main(
+        args, backbone_builder=getattr(integration, 'build_backbone', None)
+    )
     wo_class_error = False
     model.to(device)
 
@@ -171,7 +173,10 @@ def main(args):
     logger.info('number of params:'+str(n_parameters))
     logger.info("params:\n"+json.dumps({n: p.numel() for n, p in model.named_parameters() if p.requires_grad}, indent=2))
 
-    param_dicts = get_param_dict(args, model_without_ddp)
+    parameter_group_builder = getattr(
+        integration, 'build_parameter_groups', get_param_dict
+    )
+    param_dicts = parameter_group_builder(args, model_without_ddp)
 
     optimizer_class = {
         'adam': torch.optim.Adam,
@@ -194,8 +199,9 @@ def main(args):
     )
     
 
-    dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
+    dataset_builder = getattr(integration, 'build_dataset', build_dataset)
+    dataset_train = dataset_builder(image_set='train', args=args)
+    dataset_val = dataset_builder(image_set='val', args=args)
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train, seed=args.seed)
@@ -254,6 +260,8 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
+    weights_dir = Path(args.weights_dir)
+    weights_dir.mkdir(parents=True, exist_ok=True)
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -313,6 +321,9 @@ def main(args):
         args._tracking_eval_prefix = 'eval'
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir, wo_class_error=wo_class_error, args=args)
+        evaluation_callback = getattr(integration, 'on_evaluation', None)
+        if evaluation_callback is not None:
+            evaluation_callback(test_stats, coco_evaluator, args)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
 
@@ -335,34 +346,9 @@ def main(args):
             args.clip_max_norm, wo_class_error=wo_class_error,
             lr_scheduler=lr_scheduler, args=args,
             logger=(logger if args.save_log else None), ema_m=ema_m,
-            scaler=scaler)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-
+            scaler=scaler,
+            step_callback=getattr(integration, 'on_train_step', None))
         lr_scheduler.step()
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            is_lr_drop = (
-                args.scheduler == 'step' and (epoch + 1) % args.lr_drop == 0
-            ) or (
-                args.scheduler == 'multistep' and (epoch + 1) in args.lr_drop_list
-            )
-            if is_lr_drop or (epoch + 1) % args.save_checkpoint_interval == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                weights = {
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }
-                if args.use_ema:
-                    weights.update({
-                        'ema_model': ema_m.module.state_dict(),
-                    })
-                utils.save_on_master(weights, checkpoint_path)
                 
         should_evaluate = (
             (epoch + 1) % args.evaluate_every_epochs == 0
@@ -378,10 +364,13 @@ def main(args):
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
                 wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
             )
+            evaluation_callback = getattr(integration, 'on_evaluation', None)
+            if evaluation_callback is not None:
+                evaluation_callback(test_stats, coco_evaluator, args)
             map_regular = test_stats['coco_eval_bbox'][0]
             _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
             if _isbest:
-                checkpoint_path = output_dir / 'checkpoint_best_regular.pth'
+                checkpoint_path = weights_dir / 'best_regular.pth'
                 utils.save_on_master({
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -402,11 +391,14 @@ def main(args):
                 ema_m.module, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
                 wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
             )
+            evaluation_callback = getattr(integration, 'on_evaluation', None)
+            if evaluation_callback is not None:
+                evaluation_callback(ema_test_stats, ema_coco_evaluator, args)
             log_stats.update({f'ema_test_{k}': v for k,v in ema_test_stats.items()})
             map_ema = ema_test_stats['coco_eval_bbox'][0]
             _isbest = best_map_holder.update(map_ema, epoch, is_ema=True)
             if _isbest:
-                checkpoint_path = output_dir / 'checkpoint_best_ema.pth'
+                checkpoint_path = weights_dir / 'best_ema.pth'
                 utils.save_on_master({
                     'model': ema_m.module.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -415,6 +407,21 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)
+        if should_evaluate:
+            weights = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'epoch': epoch,
+                'args': args,
+            }
+            if args.use_ema:
+                weights['ema_model'] = ema_m.module.state_dict()
+            # A successful validation publishes exactly one deterministic
+            # resume target inside the user-selected weights directory.
+            utils.save_on_master(weights, weights_dir / RECENT_CHECKPOINT_NAME)
+
         log_stats.update(best_map_holder.summary())
 
         ep_paras = {

@@ -2,7 +2,7 @@
 """
 Train and eval functions used in main.py
 """
-# Modified for DiTLayoutBench: optional per-training-step metric callback.
+# Modified for DiTLayoutBench: explicit per-training-step metric callback.
 
 import math
 import os
@@ -18,15 +18,11 @@ from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 
 
-# Optional integration hook. It remains None in the upstream standalone runner.
-TRAIN_STEP_CALLBACK = None
-
-
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, 
                     wo_class_error=False, lr_scheduler=None, args=None, logger=None,
-                    ema_m=None, scaler=None):
+                    ema_m=None, scaler=None, step_callback=None):
     if scaler is None:
         raise ValueError("train_one_epoch requires a persistent GradScaler")
 
@@ -128,7 +124,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-        if TRAIN_STEP_CALLBACK is not None:
+        if step_callback is not None:
             step_metrics = {
                 "loss": loss_value,
                 **{
@@ -139,7 +135,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             }
             if len(optimizer.param_groups) > 1:
                 step_metrics["lr_backbone"] = optimizer.param_groups[1]["lr"]
-            TRAIN_STEP_CALLBACK(step_metrics, global_step)
+            step_callback(step_metrics, global_step)
 
         _cnt += 1
         if args.debug:
