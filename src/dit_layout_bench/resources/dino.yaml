@@ -1,0 +1,84 @@
+run:
+  detector: dino
+  device: cuda
+  seed: 42
+  num_workers: 4
+  amp: false
+
+paths:
+  data_root: ""
+  output_dir: outputs
+  weights_dir: weights
+  pretrained: ""
+
+input:
+  short_edge_scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+  max_long_edge: 1333
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+  random_flip: horizontal
+
+training:
+  batch_size: 2
+  epochs: 12
+  detector_lr: 1.0e-4
+  backbone_lr: 1.0e-5
+  weight_decay: 0.05
+  warmup_iters: 1000
+  warmup_factor: 0.001
+  evaluate_every_epochs: 1
+  pin_memory: true
+  non_blocking: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+dit:
+  drop_path: 0.1
+  use_checkpoint: true
+  pyramid_channels: 256
+
+dino:
+  optimizer: adamw
+  fused_optimizer: true
+  adam_betas: [0.9, 0.999]
+  scheduler: step
+  hidden_dim: 256
+  num_feature_levels: 4
+  encoder_enabled: true
+  enc_layers: 6
+  dec_layers: 6
+  nheads: 8
+  dim_feedforward: 2048
+  dropout: 0.0
+  enc_n_points: 4
+  dec_n_points: 4
+  num_queries: 300
+  num_select: 300
+  use_dn: true
+  dn_number: 100
+  dn_box_noise_scale: 0.4
+  dn_label_noise_ratio: 0.5
+  aux_loss: true
+  lr_drop_epoch: 11
+  lr_drop_epochs: [11]
+  clip_max_norm: 0.1
+  set_cost_class: 2.0
+  set_cost_bbox: 5.0
+  set_cost_giou: 2.0
+  cls_loss_coef: 1.0
+  bbox_loss_coef: 5.0
+  giou_loss_coef: 2.0
+  focal_alpha: 0.25
+  use_ema: false
+  ema_decay: 0.9997
+  ema_epoch: 0
+  ddp_gradient_as_bucket_view: true
+  ddp_static_graph: true
+  score_threshold: 0.5
+
+tracking:
+  enabled: true
+  tracking_uri: sqlite:///mlflow.db
+  experiment_name: dit-dino-publaynet
+  run_name: ""
+  log_every_steps: 20
